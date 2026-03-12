@@ -1,0 +1,1031 @@
+import asyncio
+import json
+import logging
+import time
+import re
+import shutil
+from pathlib import Path
+from typing import Optional, Dict, Any, Tuple, List, Union
+import aiofiles
+
+from config import (
+    SUPPORTED_SOURCES, CLEANUP_DELAY, CLEANUP_ON_ERROR,
+    CLEANUP_JSON, CLEANUP_VIDEO, CLEANUP_SUBTITLE, CLEANUP_OUTPUT
+)
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
+
+# Daftar semua variasi kode subtitle Indonesia
+INDONESIAN_SUBTITLE_CODES = [
+    # Language codes
+    "id", "id-ID", "id-id", "id_id", "ind", "in", "ID", "ID-ID",
+    # Full names
+    "indonesia", "indonesian", "bahasa", "bahasa_indonesia", "bahasa indonesia",
+    "indonesian subtitle", "sub indo", "subtitle indonesia",
+    # Common field names
+    "sub_id", "sub_ind", "subtitle_id", "subtitle_ind", "subtitle_indo",
+    "sub_idn", "subtitle_idn", "sub_bahasa", "subtitles_id",
+    # Numeric codes (common in some APIs)
+    "23", "102", "105",
+    # Other variations
+    "indonesian (id)", "id (indonesian)", "id-id (indonesian)",
+    "id-ID (Indonesian)", "bahasa (id)", "indo", "indon"
+]
+
+class FileCleanup:
+    """Utility class untuk auto cleanup files"""
+    
+    def __init__(self):
+        self.files_to_cleanup = []
+        self.cleanup_task = None
+    
+    @staticmethod
+    async def safe_delete(file_path: Union[str, Path], delay: int = 0) -> bool:
+        """
+        Hapus file dengan aman
+        Args:
+            file_path: Path file yang akan dihapus
+            delay: Delay sebelum hapus (detik)
+        Returns:
+            bool: True jika berhasil, False jika gagal
+        """
+        if not file_path:
+            return False
+        
+        path = Path(file_path)
+        
+        if delay > 0:
+            await asyncio.sleep(delay)
+        
+        try:
+            if path.exists():
+                if path.is_file():
+                    path.unlink()
+                    logger.info(f"✅ File dihapus: {path.name}")
+                elif path.is_dir():
+                    shutil.rmtree(path)
+                    logger.info(f"✅ Folder dihapus: {path.name}")
+                return True
+            else:
+                logger.debug(f"File tidak ditemukan: {path.name}")
+                return False
+        except PermissionError:
+            logger.warning(f"❌ Tidak bisa menghapus {path.name} (Permission denied)")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Gagal menghapus {path.name}: {e}")
+            return False
+    
+    @staticmethod
+    async def cleanup_episode_files(
+        video_path: Optional[Path] = None,
+        subtitle_path: Optional[Path] = None,
+        output_path: Optional[Path] = None,
+        json_path: Optional[Path] = None,
+        delay: int = CLEANUP_DELAY
+    ):
+        """
+        Hapus semua file yang terkait dengan satu episode
+        """
+        logger.info(f"🧹 Membersihkan file episode... (delay {delay}s)")
+        
+        tasks = []
+        
+        if CLEANUP_VIDEO and video_path:
+            tasks.append(FileCleanup.safe_delete(video_path, delay))
+        
+        if CLEANUP_SUBTITLE and subtitle_path:
+            tasks.append(FileCleanup.safe_delete(subtitle_path, delay))
+        
+        if CLEANUP_OUTPUT and output_path:
+            tasks.append(FileCleanup.safe_delete(output_path, delay))
+        
+        if CLEANUP_JSON and json_path:
+            tasks.append(FileCleanup.safe_delete(json_path, delay))
+        
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            success = sum(1 for r in results if r is True)
+            logger.info(f"✅ {success} file berhasil dibersihkan")
+    
+    @staticmethod
+    async def cleanup_batch_files(
+        file_list: List[Path],
+        delay: int = CLEANUP_DELAY,
+        on_error: bool = False
+    ):
+        """
+        Hapus banyak file sekaligus
+        """
+        if on_error and not CLEANUP_ON_ERROR:
+            logger.info("🧹 Cleanup on error disabled, skipping...")
+            return
+        
+        if not file_list:
+            return
+        
+        logger.info(f"🧹 Membersihkan {len(file_list)} file...")
+        await asyncio.sleep(delay)
+        
+        success = 0
+        for file_path in file_list:
+            if await FileCleanup.safe_delete(file_path):
+                success += 1
+        
+        logger.info(f"✅ {success}/{len(file_list)} file dibersihkan")
+    
+    @staticmethod
+    async def cleanup_old_files(directory: Path, minutes: int = 5):
+        """
+        Hapus file yang lebih lama dari X menit
+        """
+        if not directory.exists():
+            return
+        
+        cutoff_time = time.time() - (minutes * 60)
+        deleted = 0
+        
+        for file_path in directory.glob("*"):
+            if file_path.is_file():
+                try:
+                    mtime = file_path.stat().st_mtime
+                    if mtime < cutoff_time:
+                        file_path.unlink()
+                        deleted = deleted + 1  # type: ignore
+                        logger.info(f"🧹 Hapus file lama: {file_path.name}")
+                except Exception as e:
+                    logger.error(f"Gagal hapus {file_path.name}: {e}")
+        
+        if deleted > 0:
+            logger.info(f"✅ {deleted} file lama dibersihkan")
+
+
+class SubtitleDetector:
+    """Helper class to detect Indonesian subtitles in various formats"""
+    
+    @staticmethod
+    def is_indonesian_subtitle(subtitle_data: Dict[str, Any]) -> bool:
+        """Check if subtitle data is for Indonesian language"""
+        language_fields = [
+            "language", "lang", "language_code", "lang_code", 
+            "code", "languageId", "lang_id", "sub_lang", "subtitle_lang",
+            "locale", "language_name", "name", "display_name", "title"
+        ]
+        
+        for field in language_fields:
+            if field in subtitle_data:
+                value = str(subtitle_data[field]).lower().strip()
+                for code in INDONESIAN_SUBTITLE_CODES:
+                    if code.lower() in value or value in code.lower():
+                        logger.info(f"Found Indonesian subtitle with {field}={value}")
+                        return True
+        
+        type_fields = ["type", "subtitle_type", "origin", "source", "category"]
+        for field in type_fields:
+            if field in subtitle_data:
+                value = str(subtitle_data[field]).lower().strip()
+                if "original" in value or "indonesian" in value or "bahasa" in value:
+                    logger.info(f"Found Indonesian subtitle with {field}={value}")
+                    return True
+        
+        return False
+    
+    @staticmethod
+    def find_indonesian_subtitle(subtitle_list: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Find Indonesian subtitle in a list of subtitles"""
+        for subtitle in subtitle_list:
+            if SubtitleDetector.is_indonesian_subtitle(subtitle):
+                return subtitle
+        return None
+    
+    @staticmethod
+    def get_subtitle_url(subtitle_data: Dict[str, Any]) -> Optional[str]:
+        """Extract subtitle URL from subtitle data"""
+        url_fields = [
+            "url", "subtitle", "subtitle_url", "file", "path", "src",
+            "link", "download_url", "sub", "sub_file", "subtitle_file",
+            "sub_link", "subtitle_link", "srt", "vtt", "subtitle_path"
+        ]
+        
+        for field in url_fields:
+            if field in subtitle_data and subtitle_data[field]:
+                url = subtitle_data[field]
+                if isinstance(url, str) and url.startswith(('http://', 'https://')):
+                    return url
+                elif isinstance(url, str) and url:
+                    logger.warning(f"Found relative subtitle URL: {url}")
+                    return url
+        
+        return None
+
+
+class JSONParser:
+    """Parse various JSON formats from different sources"""
+    
+    @staticmethod
+    async def parse_json_file(file_path: Path) -> Optional[Dict[str, Any]]:
+        """Parse JSON file and return data"""
+        try:
+            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
+                content = await f.read()
+                return json.loads(content)
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error reading JSON file: {e}")
+            return None
+    
+    @staticmethod
+    def extract_video_url(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Extract video URL and subtitle URL from JSON data
+        Returns (video_url, subtitle_url)
+        """
+        video_url: Optional[str] = None
+        subtitle_url: Optional[str] = None
+        
+        # Try to detect source format
+        data_dict = data.get("data")
+        if "videos" in data:  # goodshort format
+            return JSONParser._parse_goodshort(data)
+        elif "videoInfo" in data and "episodesInfo" in data:  # velolo format
+            logger.info("Detected velolo format")
+            return JSONParser._parse_velolo(data)
+        elif "data" in data and isinstance(data.get("data"), dict):
+            data_dict = data["data"]
+            
+            # Dramabox v2 - cek dulu karena punya episodes array
+            if "episodes" in data_dict and isinstance(data_dict["episodes"], list):
+                logger.info("Detected dramabox v2 format")
+                return JSONParser._parse_dramabox_v2(data)
+            elif "list" in data_dict:  # dramabox v1 format
+                return JSONParser._parse_dramabox(data)
+            elif "info" in data_dict:  # dramawave format
+                return JSONParser._parse_dramawave(data)
+            elif "play_url" in data_dict:  # meloshort format
+                return JSONParser._parse_meloshort(data)
+        elif "payload" in data and "url" in data["payload"]:  # vigloo format
+            return JSONParser._parse_vigloo(data)
+        elif "list" in data.get("data", {}):  # flikreels format
+            return JSONParser._parse_flikreels(data)
+        elif "episode_list" in data:  # freereels format
+            return JSONParser._parse_freereels(data)
+        
+        # Generic fallback - try common patterns
+        return JSONParser._parse_generic(data)
+    
+    @staticmethod
+    def extract_all_episodes(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract all episodes from JSON data with subtitle detection
+        Returns list of episodes with {title, url, subtitle_url, episode_num}
+        """
+        episodes = []
+        
+        try:
+            # ── Velolo format ──────────────────────────────────────────────────
+            if "videoInfo" in data and "episodesInfo" in data:
+                drama_title = data["videoInfo"].get("name", "Video")
+                rows = data["episodesInfo"].get("rows", [])
+                logger.info(f"Detected velolo format with {len(rows)} episodes")
+                for row in rows:
+                    order = row.get("orderNumber", 0)
+                    ep_num = str(order + 1)
+                    video_url = row.get("videoAddress", "")
+                    subtitle_url = row.get("zimu") or None
+                    if video_url:
+                        episodes.append({
+                            "episode": ep_num,
+                            "title": drama_title,
+                            "url": video_url,
+                            "subtitle_url": subtitle_url,
+                            "has_subtitle": bool(subtitle_url)
+                        })
+                # Sort dan return langsung agar tidak masuk blok lain
+                episodes.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
+                return episodes
+
+            # Dramabox v2 format (dengan array episodes)
+            if "data" in data and "episodes" in data["data"] and isinstance(data["data"]["episodes"], list):
+                book_data = data["data"]
+                book_name = book_data.get("bookName", "Drama")
+                episodes_list = book_data.get("episodes", [])
+                
+                logger.info(f"Detected dramabox v2 format with {len(episodes_list)} episodes")
+                
+                for idx, episode in enumerate(episodes_list):
+                    chapter_index = episode.get("chapterIndex", idx)
+                    episode_num = str(chapter_index + 1)  # Convert 0-based to 1-based
+                    
+                    # Extract video URL dari qualities
+                    video_url = None
+                    qualities = episode.get("qualities", [])
+                    qualities_map = {}  # {height: url} — simpan semua quality
+                    
+                    if qualities:
+                        for q in qualities:
+                            q_height = q.get("quality")
+                            q_path = q.get("videoPath")
+                            if q_height and q_path:
+                                qualities_map[int(q_height)] = q_path
+                        
+                        # Pilih kualitas terbaik sebagai default
+                        for quality in [1080, 720, 540, 480, 360]:
+                            if quality in qualities_map:
+                                video_url = qualities_map[quality]
+                                logger.info(f"Episode {episode_num}: Default {quality}p video")
+                                break
+                        
+                        # Fallback ke kualitas pertama
+                        if not video_url and len(qualities) > 0:
+                            video_url = qualities[0].get("videoPath")
+                    
+                    # Fallback ke URL langsung
+                    if not video_url:
+                        video_url = episode.get("url")
+                    
+                    # Cari subtitle
+                    subtitle_url = None
+                    subtitles = episode.get("subtitles", [])
+                    if subtitles:
+                        indo_sub = SubtitleDetector.find_indonesian_subtitle(subtitles)
+                        if indo_sub:
+                            subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                            if subtitle_url:
+                                logger.info(f"Episode {episode_num}: Found Indonesian subtitle")
+                    
+                    # Dapatkan cover image jika ada
+                    cover_url = episode.get("cover", "")
+                    
+                    if video_url:
+                        episodes.append({
+                            "episode": episode_num,
+                            "title": f"Episode {episode_num}",
+                            "drama_title": book_name,
+                            "url": video_url,
+                            "subtitle_url": subtitle_url,
+                            "cover_url": cover_url,
+                            "has_subtitle": subtitle_url is not None,
+                            "qualities_map": qualities_map,  # {height: url}
+                        })
+            
+            # Dramabox format
+            elif "data" in data and "list" in data["data"]:
+                episode_list = data["data"]["list"]
+                if isinstance(episode_list, list):
+                    for idx, item in enumerate(episode_list):
+                        if not isinstance(item, dict): continue
+                        episode_num = item.get("chapterName", str(idx + 1))
+                        episode_num = re.sub(r'[^0-9]', '', episode_num) or str(idx + 1)
+                        
+                        # Get video URL
+                        video_url = None
+                        if "cdn" in item and item["cdn"]:
+                            video_url = item["cdn"]
+                        elif "multiVideos" in item and len(item["multiVideos"]) > 0:
+                            for vid in item["multiVideos"]:
+                                if vid.get("type") == "720p" and vid.get("filePath"):
+                                    video_url = vid["filePath"]
+                                    break
+                            if not video_url:
+                                video_url = item["multiVideos"][0].get("filePath")
+                        
+                        subtitle_url = None
+                        
+                        if video_url:
+                            episodes.append({
+                                "episode": episode_num,
+                                "title": f"Episode {episode_num}",
+                                "url": video_url,
+                                "subtitle_url": subtitle_url
+                            })
+            
+            # Dramawave format with subtitle detection
+            elif "data" in data and "info" in data["data"]:
+                info = data["data"]["info"]
+                if "episode_list" in info:
+                    episode_list = info["episode_list"]
+                    if isinstance(episode_list, list):
+                        for idx, item in enumerate(episode_list):
+                            if not isinstance(item, dict): continue
+                            episode_num = str(item.get("index", idx + 1))
+                            title = item.get("name", f"Episode {episode_num}")
+                            
+                            if "external_audio_h264_m3u8" in item and item["external_audio_h264_m3u8"]:
+                                video_url = item["external_audio_h264_m3u8"]
+                            elif "external_audio_h265_m3u8" in item and item["external_audio_h265_m3u8"]:
+                                video_url = item["external_audio_h265_m3u8"]
+                            elif "video_url" in item and item["video_url"]:
+                                video_url = item["video_url"]
+                            elif "m3u8_url" in item and item["m3u8_url"]:
+                                video_url = item["m3u8_url"]
+                            
+                            # Get Indonesian subtitle
+                            subtitle_url = None
+                            subs = item.get("subtitle_list")
+                            if isinstance(subs, list) and len(subs) > 0:
+                                indo_sub = SubtitleDetector.find_indonesian_subtitle(subs)
+                                if indo_sub:
+                                    subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                                    logger.info(f"Found Indonesian subtitle for episode {episode_num}")
+                            
+                            if video_url:
+                                episodes.append({
+                                    "episode": episode_num,
+                                    "title": title,
+                                    "url": video_url,
+                                    "subtitle_url": subtitle_url
+                                })
+            
+            # Stardust format
+            elif "data" in data and "episodes" in data["data"] and isinstance(data["data"]["episodes"], dict):
+                episodes_dict = data["data"]["episodes"]
+                for ep_num, ep_data in episodes_dict.items():
+                    video_url = None
+                    if "h264" in ep_data:
+                        video_url = ep_data["h264"]
+                    elif "h265" in ep_data:
+                        video_url = ep_data["h265"]
+                    
+                    subtitle_url = None
+                    
+                    if video_url:
+                        episodes.append({
+                            "episode": ep_num,
+                            "title": f"Episode {ep_num}",
+                            "url": video_url,
+                            "subtitle_url": subtitle_url
+                        })
+            
+            # Meloshort format with subtitle detection
+            elif "data" in data and "drama_title" in data["data"]:
+                d = data["data"]
+                if "chapters" in d and isinstance(d["chapters"], list):
+                    for chapter in d["chapters"]:
+                        episode_num = str(chapter.get("chapter_index", chapter.get("index", 1)))
+                        video_url = chapter.get("play_url")
+                        
+                        subtitle_url = None
+                        if "sublist" in chapter and len(chapter["sublist"]) > 0:
+                            indo_sub = SubtitleDetector.find_indonesian_subtitle(chapter["sublist"])
+                            if indo_sub:
+                                subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                        
+                        if video_url:
+                            episodes.append({
+                                "episode": episode_num,
+                                "title": f"Episode {episode_num}",
+                                "url": video_url,
+                                "subtitle_url": subtitle_url
+                            })
+                else:
+                    episode_num = str(d.get("chapter_index", d.get("index", 1)))
+                    video_url = d.get("play_url")
+                    
+                    subtitle_url = None
+                    if "sublist" in d and len(d["sublist"]) > 0:
+                        indo_sub = SubtitleDetector.find_indonesian_subtitle(d["sublist"])
+                        if indo_sub:
+                            subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                    
+                    if video_url:
+                        episodes.append({
+                            "episode": episode_num,
+                            "title": d.get("drama_title", "Video"),
+                            "url": video_url,
+                            "subtitle_url": subtitle_url
+                        })
+            
+            # Goodshort format
+            elif "videos" in data:
+                for idx, item in enumerate(data["videos"]):
+                    episode_num = item.get("name", str(idx + 1))
+                    ep_match = re.search(r'(\d+)', episode_num)
+                    if ep_match:
+                        episode_num = ep_match.group(1)
+                    
+                    if "url" in item:
+                        episodes.append({
+                            "episode": episode_num,
+                            "title": f"Episode {episode_num}",
+                            "url": item["url"],
+                            "subtitle_url": None
+                        })
+            
+            # Flikreels format
+            elif "data" in data and "list" in data["data"]:
+                data_list = data["data"]["list"]
+                if isinstance(data_list, list):
+                    for item in data_list:
+                        if not isinstance(item, dict): continue
+                        if "hls_url" in item and item["hls_url"]:
+                            episode_num = str(item.get("chapter_num", ""))
+                        episodes.append({
+                            "episode": episode_num,
+                            "title": item.get("chapter_title", f"Episode {episode_num}"),
+                            "url": item["hls_url"],
+                            "subtitle_url": None
+                        })
+            
+            # Freereels format with subtitle detection
+            elif "episode_list" in data:
+                ep_list = data["episode_list"]
+                if isinstance(ep_list, list):
+                    for idx, item in enumerate(ep_list):
+                        if not isinstance(item, dict): continue
+                        episode_num = str(item.get("index", idx + 1))
+                    
+                    if "external_audio_h264_m3u8" in item and item["external_audio_h264_m3u8"]:
+                        video_url = item["external_audio_h264_m3u8"]
+                    elif "external_audio_h265_m3u8" in item and item["external_audio_h265_m3u8"]:
+                        video_url = item["external_audio_h265_m3u8"]
+                    elif "video_url" in item and item["video_url"]:
+                        video_url = item["video_url"]
+                    elif "m3u8_url" in item and item["m3u8_url"]:
+                        video_url = item["m3u8_url"]
+                    
+                    subtitle_url = None
+                    subs = item.get("subtitle_list")
+                    if isinstance(subs, list) and len(subs) > 0:
+                        indo_sub = SubtitleDetector.find_indonesian_subtitle(subs)
+                        if indo_sub:
+                            subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                    
+                    if video_url:
+                        episodes.append({
+                            "episode": episode_num,
+                            "title": item.get("name", f"Episode {episode_num}"),
+                            "url": video_url,
+                            "subtitle_url": subtitle_url
+                        })
+            
+            # Sort episodes by episode number
+            episodes.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
+            
+        except Exception as e:
+            logger.error(f"Error extracting all episodes: {e}")
+        
+        return episodes
+
+    @staticmethod
+    def extract_qualities_per_episode(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """
+        Extract kualitas video yang tersedia per episode dari JSON.
+
+        Return list episode, masing-masing berisi field 'qualities':
+          [
+            {
+              "episode": "1",
+              "title": "Episode 1",
+              "drama_title": "Drama Title",
+              "subtitle_url": "...",
+              "has_subtitle": True,
+              "qualities": [
+                {"label": "1080p", "url": "https://..."},
+                {"label": "720p",  "url": "https://..."},
+              ]
+            },
+            ...
+          ]
+
+        Format yang didukung:
+          - dramabox_v2  → episode[].qualities[].quality + videoPath
+          - dramabox_v1  → episode[].multiVideos[].type + filePath
+          - dramawave    → episode[] dengan beberapa field URL berbeda resolusi
+          - generic      → episode dengan satu URL saja (qualities = 1 item)
+        """
+        result = []
+
+        try:
+            # ── dramabox v2: episodes[].qualities[] ─────────────────────────
+            data_dict = data.get("data")
+            if (isinstance(data_dict, dict)
+                    and "episodes" in data_dict
+                    and isinstance(data_dict["episodes"], list)):
+
+                book   = data_dict
+                drama  = book.get("bookName", "Drama")
+                for idx, ep in enumerate(book["episodes"]):
+                    ep_num  = str(ep.get("chapterIndex", idx) + 1)
+                    ep_title = ep.get("title", f"Episode {ep_num}")
+                    raw_qs   = ep.get("qualities", [])
+
+                    # Subtitle
+                    sub_url = None
+                    subs    = ep.get("subtitles", [])
+                    if subs:
+                        indo = SubtitleDetector.find_indonesian_subtitle(subs)
+                        if indo:
+                            sub_url = SubtitleDetector.get_subtitle_url(indo)
+
+                    # Build quality list — sort descending by resolution number
+                    qualities = []
+                    for q in raw_qs:
+                        label = str(q.get("quality", ""))
+                        url   = q.get("videoPath", "")
+                        if url:
+                            # Normalize label: tambah "p" jika numeric
+                            if label.isdigit():
+                                label = f"{label}p"
+                            qualities.append({"label": label, "url": url})
+
+                    # Sort: 1080p > 720p > 480p > 360p
+                    def _res_num(q):
+                        try: return int(q["label"].rstrip("p"))
+                        except: return 0
+                    qualities.sort(key=_res_num, reverse=True)
+
+                    if qualities:
+                        result.append({
+                            "episode":      ep_num,
+                            "title":        ep_title,
+                            "drama_title":  drama,
+                            "subtitle_url": sub_url,
+                            "has_subtitle": bool(sub_url),
+                            "qualities":    qualities,
+                        })
+
+                result.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
+                if result:
+                    return result
+
+            # ── dramabox v1: list[].multiVideos[] ───────────────────────────
+            if ("data" in data
+                    and isinstance(data.get("data"), dict)
+                    and "list" in data["data"]):
+
+                for idx, item in enumerate(data["data"]["list"]):
+                    ep_num = re.sub(r"[^0-9]", "", item.get("chapterName", str(idx+1))) or str(idx+1)
+                    multi  = item.get("multiVideos", [])
+
+                    qualities = []
+                    if multi:
+                        for v in multi:
+                            label = v.get("type", "")
+                            url   = v.get("filePath", "")
+                            if url:
+                                if label.isdigit():
+                                    label = f"{label}p"
+                                qualities.append({"label": label or "?", "url": url})
+                    elif item.get("cdn"):
+                        qualities = [{"label": "Default", "url": item["cdn"]}]
+
+                    if qualities:
+                        result.append({
+                            "episode":      ep_num,
+                            "title":        f"Episode {ep_num}",
+                            "drama_title":  "Drama",
+                            "subtitle_url": None,
+                            "has_subtitle": False,
+                            "qualities":    qualities,
+                        })
+
+                result.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
+                if result:
+                    return result
+
+        except Exception as e:
+            logger.error(f"extract_qualities_per_episode error: {e}")
+
+        # ── Fallback: konversi extract_all_episodes → tiap ep punya 1 quality ─
+        episodes = JSONParser.extract_all_episodes(data)
+        for ep in episodes:
+            ep["qualities"] = [{"label": "Default", "url": ep["url"]}]
+        return episodes
+
+    @staticmethod
+    def _parse_goodshort(data: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """Parse goodshort JSON format"""
+        try:
+            if "videos" in data and len(data["videos"]) > 0:
+                video = data["videos"][0]
+                url = video.get("url")
+                return url, None
+        except Exception as e:
+            logger.error(f"Error parsing goodshort: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_dramabox(data: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """Parse dramabox JSON format (v1)"""
+        try:
+            if "data" in data and "list" in data["data"] and len(data["data"]["list"]) > 0:
+                item = data["data"]["list"][0]
+                if "cdn" in item and item["cdn"]:
+                    return item["cdn"], None
+                if "multiVideos" in item and len(item["multiVideos"]) > 0:
+                    for vid in item["multiVideos"]:
+                        if vid.get("type") == "720p" and vid.get("filePath"):
+                            return vid["filePath"], None
+                    first_vid = item["multiVideos"][0]
+                    if first_vid.get("filePath"):
+                        return first_vid["filePath"], None
+        except Exception as e:
+            logger.error(f"Error parsing dramabox: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_dramabox_v2(data: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """
+        Parse dramabox v2 JSON format (dengan array episodes dan qualities)
+        """
+        try:
+            if "data" in data and "episodes" in data["data"]:
+                episodes = data["data"]["episodes"]
+                if episodes and len(episodes) > 0:
+                    # Ambil episode pertama
+                    first_episode = episodes[0]
+                    
+                    # Cari video dengan kualitas terbaik
+                    if "qualities" in first_episode and len(first_episode["qualities"]) > 0:
+                        qualities = first_episode["qualities"]
+                        
+                        # Cari kualitas 1080p dulu, lalu 720p, lalu 540p
+                        video_url = None
+                        for quality in [1080, 720, 540, 480, 360]:
+                            for q in qualities:
+                                if q.get("quality") == quality and q.get("videoPath"):
+                                    video_url = q.get("videoPath")
+                                    logger.info(f"Found {quality}p video for dramabox v2")
+                                    break
+                            if video_url:
+                                break
+                        
+                        # Jika tidak ketemu, ambil yang pertama
+                        if not video_url and len(qualities) > 0:
+                            video_url = qualities[0].get("videoPath")
+                            logger.info(f"Using first quality available for dramabox v2")
+                        
+                        # Cari subtitle Indonesia
+                        subtitle_url = None
+                        if "subtitles" in first_episode and len(first_episode["subtitles"]) > 0:
+                            indo_sub = SubtitleDetector.find_indonesian_subtitle(first_episode["subtitles"])
+                            if indo_sub:
+                                subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                                logger.info(f"Found Indonesian subtitle in dramabox v2: {subtitle_url}")
+                        
+                        return video_url, subtitle_url
+                    
+                    # Fallback ke URL langsung jika ada
+                    elif "url" in first_episode:
+                        return first_episode["url"], None
+                        
+        except Exception as e:
+            logger.error(f"Error parsing dramabox v2: {e}")
+        
+        return None, None
+    
+    @staticmethod
+    def _parse_dramawave(data: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """Parse dramawave JSON format with Indonesian subtitle detection"""
+        try:
+            if "data" in data and "info" in data["data"]:
+                info = data["data"]["info"]
+                if "episode_list" in info and len(info["episode_list"]) > 0:
+                    episode = info["episode_list"][0]
+                    for field in ["external_audio_h264_m3u8", "external_audio_h265_m3u8", "video_url", "m3u8_url"]:
+                        if field in episode and episode[field]:
+                            video_url = episode[field]
+                            
+                            subtitle_url = None
+                            if "subtitle_list" in episode and len(episode["subtitle_list"]) > 0:
+                                indo_sub = SubtitleDetector.find_indonesian_subtitle(episode["subtitle_list"])
+                                if indo_sub:
+                                    subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                                    logger.info(f"Found Indonesian subtitle in dramawave: {subtitle_url}")
+                            
+                            return video_url, subtitle_url
+        except Exception as e:
+            logger.error(f"Error parsing dramawave: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_stardust(data: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """Parse stardust JSON format"""
+        try:
+            if "data" in data and "episodes" in data["data"]:
+                episodes = data["data"]["episodes"]
+                if episodes and "1" in episodes:
+                    episode = episodes["1"]
+                    if "h264" in episode and episode["h264"]:
+                        return episode["h264"], None
+                    if "h265" in episode and episode["h265"]:
+                        return episode["h265"], None
+        except Exception as e:
+            logger.error(f"Error parsing stardust: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_vigloo(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Parse vigloo JSON format"""
+        try:
+            if "payload" in data and "url" in data["payload"]:
+                url = data["payload"]["url"]
+                return url, None
+        except Exception as e:
+            logger.error(f"Error parsing vigloo: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_meloshort(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Parse meloshort JSON format with Indonesian subtitle detection"""
+        try:
+            if "data" in data:
+                d = data["data"]
+                video_url = d.get("play_url")
+                
+                subtitle_url = None
+                if "sublist" in d and len(d["sublist"]) > 0:
+                    indo_sub = SubtitleDetector.find_indonesian_subtitle(d["sublist"])
+                    if indo_sub:
+                        subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                        logger.info(f"Found Indonesian subtitle in meloshort: {subtitle_url}")
+                
+                if video_url:
+                    return video_url, subtitle_url
+        except Exception as e:
+            logger.error(f"Error parsing meloshort: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_flikreels(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Parse flikreels JSON format"""
+        try:
+            if "data" in data and "list" in data["data"] and len(data["data"]["list"]) > 0:
+                episode = data["data"]["list"][0]
+                if "hls_url" in episode and episode["hls_url"]:
+                    return episode["hls_url"], None
+        except Exception as e:
+            logger.error(f"Error parsing flikreels: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_freereels(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Parse freereels JSON format with Indonesian subtitle detection"""
+        try:
+            if "episode_list" in data and len(data["episode_list"]) > 0:
+                episode = data["episode_list"][0]
+                for field in ["external_audio_h264_m3u8", "external_audio_h265_m3u8", "video_url", "m3u8_url"]:
+                    if field in episode and episode[field]:
+                        video_url = episode[field]
+                        
+                        subtitle_url = None
+                        if "subtitle_list" in episode and len(episode["subtitle_list"]) > 0:
+                            indo_sub = SubtitleDetector.find_indonesian_subtitle(episode["subtitle_list"])
+                            if indo_sub:
+                                subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                                logger.info(f"Found Indonesian subtitle in freereels: {subtitle_url}")
+                        
+                        return video_url, subtitle_url
+        except Exception as e:
+            logger.error(f"Error parsing freereels: {e}")
+        return None, None
+    
+    @staticmethod
+    def _parse_velolo(data: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """Parse velolo JSON format (videoInfo + episodesInfo)"""
+        try:
+            rows = data.get("episodesInfo", {}).get("rows", [])
+            if rows:
+                first = rows[0]
+                video_url = first.get("videoAddress")
+                subtitle_url = first.get("zimu") or None
+                if video_url:
+                    logger.info(f"Velolo: video={video_url[:80]}, sub={subtitle_url}")
+                    return video_url, subtitle_url
+        except Exception as e:
+            logger.error(f"Error parsing velolo: {e}")
+        return None, None
+
+    @staticmethod
+    def _parse_generic(data: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+        """Generic fallback parser with subtitle detection"""
+        video_url = None
+        subtitle_url = None
+        
+        try:
+            if isinstance(data, dict):
+                url_fields = ["url", "video_url", "download_url", "cdn", "filePath", "play_url", "hls_url"]
+                for field in url_fields:
+                    val = data.get(field)
+                    if isinstance(val, str):
+                        video_url = val
+                        break
+                    elif isinstance(val, dict):
+                        for nested_field in url_fields:
+                            nested_val = val.get(nested_field)
+                            if isinstance(nested_val, str):
+                                video_url = nested_val
+                                break
+                
+                # Look for subtitle in various places
+                for sub_field in ["subtitles", "subtitle_list", "sublist", "subs"]:
+                    subs_list = data.get(sub_field)
+                    if isinstance(subs_list, list):
+                        indo_sub = SubtitleDetector.find_indonesian_subtitle(subs_list)
+                        if indo_sub:
+                            subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
+                            break
+                
+                if not subtitle_url:
+                    sub_fields = ["subtitle", "subtitle_url", "srt", "sub", "sub_file", "sub_link"]
+                    for field in sub_fields:
+                        val = data.get(field)
+                        if isinstance(val, str):
+                            if any(code in field.lower() for code in ["id", "ind", "bahasa", "indo"]):
+                                subtitle_url = val
+                                logger.info(f"Found possible Indonesian subtitle in field {field}")
+                                break
+                            elif not subtitle_url:
+                                subtitle_url = val
+                    
+        except Exception as e:
+            logger.error(f"Error in generic parser: {e}")
+        
+        return video_url, subtitle_url
+
+
+class ProgressTracker:
+    def __init__(self, total: int, callback=None):
+        self.total = total
+        self.current = 0
+        self.callback = callback
+        self.start_time: Optional[float] = None
+        self.last_update: float = 0.0
+        
+    async def start(self):
+        self.start_time = time.time()
+        
+    async def update(self, n: int):
+        self.current = n
+        now = time.time()
+        
+        if now - self.last_update > 0.5:
+            self.last_update = now
+            if self.callback:
+                await self.callback(self.current, self.total)
+    
+    def get_speed(self) -> float:
+        st = self.start_time
+        if st is None:
+            return 0.0
+        elapsed = time.time() - st
+        return self.current / elapsed if elapsed > 0 else 0.0
+
+
+class RateLimiter:
+    def __init__(self, max_concurrent: int):
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.active = 0
+        
+    async def acquire(self):
+        await self.semaphore.acquire()
+        self.active += 1
+        
+    def release(self):
+        self.semaphore.release()
+        self.active -= 1
+        
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+        
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+async def cleanup_file(file_path: Path, delay: int = 0) -> bool:
+    """
+    Fungsi compatibility untuk cleanup file
+    Args:
+        file_path: Path file yang akan dihapus
+        delay: Delay sebelum hapus
+    Returns:
+        bool: True jika berhasil
+    """
+    return await FileCleanup.safe_delete(file_path, delay)
+
+
+def format_size(size_bytes: float) -> str:
+    """Format file size"""
+    if size_bytes == 0:
+        return "0 B"
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.1f} {unit}"
+        size_bytes = size_bytes / 1024.0
+    return f"{float(size_bytes):.1f} TB"
+
+
+def format_speed(bytes_per_sec: float) -> str:
+    """Format download/upload speed"""
+    return f"{format_size(bytes_per_sec)}/s"
