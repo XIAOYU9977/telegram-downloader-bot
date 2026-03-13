@@ -26,6 +26,11 @@ from config import (
     X264_PARAMS, AUDIO_CODEC, MOVFLAGS, FFMPEG_THREADS
 )
 
+try:
+    from shortmax import ShortmaxDecryptor
+except ImportError:
+    ShortmaxDecryptor = None
+
 class HLSStreamInfo:
     """Informasi lengkap tentang HLS stream - UPDATED with audio & subtitle support"""
     def __init__(self):
@@ -1024,6 +1029,10 @@ class OptimizedHLSDownloader:
                             if resp.status == 200:
                                 content = await resp.read()
                                 if content:
+                                    # Shortmax decryption support
+                                    if ShortmaxDecryptor and content.startswith(b'shortmax'):
+                                        content = ShortmaxDecryptor.decrypt_segment(content)
+                                        
                                     async with aiofiles.open(target_path, 'wb') as f:
                                         await f.write(content)
                                     return target_path

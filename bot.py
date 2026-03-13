@@ -44,7 +44,8 @@ class DownloaderBot:
         self.task_tracker = TaskTracker()
         self.download_manager = DownloadManager(self.task_tracker)
         self.video_processor = VideoProcessor(self.task_tracker)
-        self.uploader = TelegramUploader(BOT_TOKEN)
+        from telegram import Bot
+        self.uploader = TelegramUploader(Bot(BOT_TOKEN))
         self.session_manager = SessionManager()
         self.cleanup = FileCleanup()
         self.download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
@@ -524,6 +525,24 @@ class DownloaderBot:
                     if first_ep.get("zimu"):
                         has_subtitle = True
                 return title, episode, has_subtitle
+
+            # ── Shortmax format ───────────────────────────────────────────────
+            if "shortPlayId" in data or "shortPlayName" in data:
+                title = data.get("shortPlayName", "Shortmax Video")
+                episodes = data.get("episodes", [])
+                if episodes:
+                    first_ep = episodes[0]
+                    episode = str(first_ep.get("episodeNumber", "1"))
+                return title, episode, False
+
+            # ── Netshort format ───────────────────────────────────────────────
+            if "shortPlayEpisodeInfos" in data:
+                title = data.get("shortPlayName") or data.get("title") or "Netshort Video"
+                episodes = data.get("shortPlayEpisodeInfos", [])
+                if episodes:
+                    first_ep = episodes[0]
+                    episode = str(first_ep.get("episodeNo") or first_ep.get("episodeNumber", "1"))
+                return title, episode, False
 
             # Dramaflickreels format
             if "drama" in data and "episodes" in data:

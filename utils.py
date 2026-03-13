@@ -14,6 +14,16 @@ from config import (
     CLEANUP_JSON, CLEANUP_VIDEO, CLEANUP_SUBTITLE, CLEANUP_OUTPUT
 )
 
+try:
+    from shortmax import ShortmaxParser
+except ImportError:
+    ShortmaxParser = None
+
+try:
+    from netshort import NetshortParser
+except ImportError:
+    NetshortParser = None
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -48,6 +58,7 @@ def get_headers(url: str) -> Dict[str, str]:
         "Accept": "*/*"
     }
 
+# Universal JSON Parser for various drama video sources
 class JSONParser:
     """Universal JSON Parser for various drama video sources"""
     
@@ -432,8 +443,20 @@ class JSONParser:
         
         # Try to detect source format
         data_dict = data.get("data")
-        if "videos" in data:  # goodshort format
+        if "videos" in data and "shortPlayId" not in data:  # goodshort format
             return JSONParser._parse_goodshort(data)
+        elif ("videoUrl" in data or "shortPlayId" in data) and ShortmaxParser: # shortmax format
+            logger.info("Detected shortmax format")
+            parsed = ShortmaxParser.parse(data)
+            if parsed["episodes"]:
+                ep = parsed["episodes"][0]
+                return ep["url"], None
+        elif "shortPlayEpisodeInfos" in data and NetshortParser: # netshort format
+            logger.info("Detected netshort format")
+            parsed = NetshortParser.parse(data)
+            if parsed["episodes"]:
+                ep = parsed["episodes"][0]
+                return ep["url"], None
         elif "videoInfo" in data and "episodesInfo" in data:  # velolo format
             logger.info("Detected velolo format")
             return JSONParser._parse_velolo(data)
@@ -747,6 +770,16 @@ class JSONParser:
                             "subtitle_url": subtitle_url
                         })
             
+            # Shortmax format
+            elif ("videoUrl" in data or "shortPlayId" in data) and ShortmaxParser:
+                parsed = ShortmaxParser.parse(data)
+                return parsed["episodes"]
+            
+            # Netshort format
+            elif "shortPlayEpisodeInfos" in data and NetshortParser:
+                parsed = NetshortParser.parse(data)
+                return parsed["episodes"]
+
             # Goodshort format
             elif "videos" in data:
                 for idx, item in enumerate(data["videos"]):

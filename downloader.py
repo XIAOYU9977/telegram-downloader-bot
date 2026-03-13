@@ -1,4 +1,5 @@
 import asyncio
+import yt_dlp
 from pathlib import Path
 from typing import Optional, Callable, List, Dict
 from urllib.parse import urlparse
@@ -102,72 +103,82 @@ class DownloadManager:
                                    is_hls: bool = False,
                                    output_format: str = "mp4",
                                    headers: Optional[Dict] = None) -> Optional[Path]:
-        """Download menggunakan yt-dlp sebagai fallback"""
+        """Download menggunakan yt-dlp library dengan advanced options"""
         try:
-            logger.info(f"🎬 Trying yt-dlp fallback: {url[:100]}")
-            
-            if is_hls:
-                # Untuk HLS: ambil format terbaik yang tersedia
-                format_selector = f"bestvideo[ext={output_format}]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext={output_format}]/best"
-            else:
-                # Untuk direct URL: paksa download langsung
-                format_selector = f"best[ext={output_format}]/best"
+            logger.info(f"🎬 Trying yt-dlp direct library: {url[:100]}")
             
             if output_format.lower() == "mkv" and output_path.suffix.lower() != ".mkv":
                 output_path = output_path.with_suffix(".mkv")
 
-            cmd = [
-                "yt-dlp",
-                "-f", format_selector,
-                "-o", str(output_path),
-                "--no-playlist",
-                "--no-warnings",
-                "--merge-output-format", output_format,
-                "--hls-prefer-native",
-                "--add-header", f"User-Agent:{headers.get('User-Agent', '')}" if headers else "",
-                "--add-header", f"Referer:{headers.get('Referer', '')}" if headers else "",
-                "--add-header", f"Origin:{headers.get('Origin', '')}" if headers else "",
-                url
-            ]
+            # Capture the current loop to use in the progress hook
+            loop = asyncio.get_running_loop()
+
+            # Progress hook for yt-dlp
+            def ydl_progress_hook(d):
+                if d['status'] == 'downloading':
+                    try:
+                        downloaded = d.get('downloaded_bytes', 0)
+                        if progress_callback and downloaded:
+                            # Use run_coroutine_threadsafe since ydl runs in a separate thread
+                            asyncio.run_coroutine_threadsafe(progress_callback(downloaded), loop)
+                    except Exception:
+                        pass
+
+            # Setup options
+            ydl_opts = {
+                "format": f"bestvideo[ext={output_format}]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext={output_format}]/best" if is_hls else f"best[ext={output_format}]/best",
+                "outtmpl": str(output_path),
+                "noplaylist": True,
+                "quiet": True,
+                "no_warnings": True,
+                "merge_output_format": output_format,
+                "http_headers": {
+                    "User-Agent": headers.get('User-Agent', "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"),
+                    "Referer": headers.get('Referer', "https://dramaflickreels.com"),
+                    "Accept": "*/*"
+                },
+                "extractor_args": {
+                    "generic": ["impersonate"]
+                },
+                "impersonate": "chrome",
+                "nocheckcertificate": True,
+                "retries": 5,
+                "fragment_retries": 5,
+                "file_access_retries": 5,
+                "concurrent_fragment_downloads": 10,
+                "progress_hooks": [ydl_progress_hook],
+            }
+
+            # Add cookies if exists
+            cookies_file = Path("cookies.txt")
+            if cookies_file.exists():
+                ydl_opts["cookiefile"] = str(cookies_file)
+                logger.info("🍪 Using cookies.txt for yt-dlp")
+
+            # Run in thread pool to not block event loop
+            loop = asyncio.get_event_loop()
             
-            # Remove empty strings from cmd
-            cmd = [c for c in cmd if c]
+            def _run_ydl():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    return ydl.download([url])
+
+            return_code = await loop.run_in_executor(None, _run_ydl)
             
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            if user_id and getattr(self, 'task_tracker', None):
-                self.task_tracker.register_process(user_id, process)
-            
-            try:
-                if progress_callback:
-                    asyncio.create_task(self._monitor_file_progress(
-                        output_path, progress_callback
-                    ))
-                
-                stdout, stderr = await process.communicate()
-            finally:
-                if user_id and getattr(self, 'task_tracker', None):
-                    self.task_tracker.unregister_process(user_id, process)
-            
-            if process.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
-                logger.info(f"✅ yt-dlp download successful: {output_path.name}")
+            if return_code == 0 and output_path.exists() and output_path.stat().st_size > 0:
+                logger.info(f"✅ yt-dlp library download successful: {output_path.name}")
                 return output_path
             else:
-                stderr_str = stderr.decode()[:300] if stderr else ""
-                logger.error(f"yt-dlp failed: {stderr_str}")
+                logger.error(f"yt-dlp library failed with code {return_code}")
                 return None
                 
         except Exception as e:
-            logger.error(f"yt-dlp error: {e}")
+            logger.error(f"yt-dlp library error: {e}")
             return None
 
     async def _download_direct_http(self, url: str, output_path: Path,
                                     user_id: int,
                                     progress_callback: Optional[Callable],
+                                    headers: Optional[Dict] = None,
                                     output_format: str = "mp4") -> Optional[Path]:
         """Download file langsung via aiohttp untuk direct MP4/video URL"""
         try:
@@ -175,11 +186,15 @@ class DownloadManager:
             import aiofiles
             logger.info(f"🌐 Trying direct HTTP download: {url[:100]}")
             
+            if not headers:
+                headers = get_headers(url)
+
             if output_format.lower() == "mkv" and output_path.suffix.lower() != ".mkv":
                 output_path = output_path.with_suffix(".mkv")
 
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            req_headers = {
+                "User-Agent": headers.get('User-Agent', "Mozilla/5.0"),
+                "Referer": headers.get('Referer', url),
                 "Accept": "video/mp4,video/*,*/*",
                 "Accept-Encoding": "identity",
             }
@@ -188,7 +203,7 @@ class DownloadManager:
             timeout = aiohttp.ClientTimeout(total=3600, connect=30)
             
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-                async with session.get(url, headers=headers, allow_redirects=True) as resp:
+                async with session.get(url, headers=req_headers, allow_redirects=True) as resp:
                     if resp.status != 200:
                         logger.warning(f"Direct HTTP failed: status {resp.status}")
                         return None
@@ -342,6 +357,7 @@ class DownloadManager:
                 "aria2c",
                 "-x", "16",
                 "-s", "16",
+                "-k", "1M",
                 "--max-connection-per-server=16",
                 "--min-split-size=1M",
                 "--file-allocation=none",
@@ -388,7 +404,7 @@ class DownloadManager:
                                           headers: Optional[Dict],
                                           output_format: str = "mp4") -> Optional[Path]:
         """Step 3: Streaming download via aiohttp (fallback terakhir)"""
-        return await self._download_direct_http(url, output_path, user_id, progress_callback, output_format)
+        return await self._download_direct_http(url, output_path, user_id, progress_callback, headers, output_format)
 
     async def close(self):
         """Cleanup resources"""
