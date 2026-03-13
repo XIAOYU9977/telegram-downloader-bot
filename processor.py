@@ -1,11 +1,14 @@
 import asyncio
 import subprocess
+import functools
 from pathlib import Path
-from typing import Optional, Callable
+from typing import Optional, Callable, Dict, Any, List
 import logging
 import os
 import aiofiles
 import chardet
+import aiohttp
+import json as _json
 
 from utils import logger
 from config import (
@@ -21,14 +24,18 @@ from config import (
     COMPRESSION_ATTEMPTS, TARGET_FILE_SIZE_MB
 )
 
+from task_tracker import TaskTracker
+
 class VideoProcessor:
-    def __init__(self):
+    def __init__(self, task_tracker: Optional[TaskTracker] = None):
+        self.task_tracker = task_tracker
         self.processing_tasks = {}
 
     # ------------------------------------------------------------------ #
     #  ENCODE – Main encode dengan semua target specs                      #
     # ------------------------------------------------------------------ #
     async def encode_video(self, input_path: Path, output_path: Path,
+                           user_id: int,
                            progress_callback: Optional[Callable] = None) -> Optional[Path]:
         """
         Encode video ke spec target:
@@ -73,7 +80,7 @@ class VideoProcessor:
             str(output_path)
         ]
 
-        result = await self._run_ffmpeg(cmd, input_path.parent, output_path, progress_callback)
+        result = await self._run_ffmpeg(cmd, input_path.parent, output_path, user_id, progress_callback)
 
         # Auto compress jika masih > TARGET_FILE_SIZE_MB
         if result and ENABLE_AUTO_COMPRESS:
@@ -81,13 +88,14 @@ class VideoProcessor:
             if size_mb > TARGET_FILE_SIZE_MB:
                 logger.warning(f"⚠️ Output {size_mb:.1f}MB > {TARGET_FILE_SIZE_MB}MB, compressing...")
                 result = await self.compress_to_target(result, output_path.with_suffix('.compressed.mp4'),
-                                                       progress_callback)
+                                                       user_id, progress_callback)
         return result
 
     # ------------------------------------------------------------------ #
     #  COMPRESS – Turunkan bitrate agar muat di Telegram                  #
     # ------------------------------------------------------------------ #
     async def compress_to_target(self, input_path: Path, output_path: Path,
+                                  user_id: int,
                                   progress_callback: Optional[Callable] = None) -> Optional[Path]:
         """Kompres video sampai di bawah TARGET_FILE_SIZE_MB"""
         duration = await self._get_duration(input_path)
@@ -134,7 +142,7 @@ class VideoProcessor:
                 str(output_path)
             ]
 
-            result = await self._run_ffmpeg(cmd, input_path.parent, output_path, progress_callback)
+            result = await self._run_ffmpeg(cmd, input_path.parent, output_path, user_id, progress_callback)
             if result:
                 size_mb = result.stat().st_size / (1024 * 1024)
                 logger.info(f"📦 Compressed: {size_mb:.1f}MB")
@@ -148,44 +156,10 @@ class VideoProcessor:
     #  SOFTSUB – Embed subtitle sebagai track soft (bisa dimatikan)       #
     # ------------------------------------------------------------------ #
     async def embed_softsub(self, video_path: Path, subtitle_path: Path,
-                             output_path: Path) -> Optional[Path]:
+                             output_path: Path, user_id: int) -> Optional[Path]:
         """
         Embed subtitle sebagai soft subtitle track.
-        - -map 0:a?  → audio opsional, aman untuk video tanpa audio stream
-        - subprocess.run() dengan full stderr logging
-        - 4 method fallback: MP4-meta → MP4-nometa → MP4-nomap → MKV
-        - Jika semua gagal → kembalikan video_path original agar bot tidak crash
         """
-        import subprocess
-        import functools
-
-        # Definisi di luar try agar bisa dipakai di except
-        def run_ffmpeg_sync(cmd: list, label: str, out_path: Path) -> Optional[Path]:
-            """
-            Jalankan ffmpeg synchronous. Log full stderr. Return output jika sukses.
-            Tidak pakai cwd — path sudah absolute, cwd justru konflik di Windows
-            jika folder mengandung spasi.
-            """
-            logger.info(f"▶ [{label}] {' '.join(str(c) for c in cmd)}")
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                )
-                if proc.returncode != 0:
-                    err = proc.stderr.decode("utf-8", errors="ignore")
-                    logger.error(f"❌ [{label}] rc={proc.returncode}\n{err}")
-                    return None
-                if out_path.exists() and out_path.stat().st_size > 0:
-                    logger.info(f"✅ [{label}] OK — {out_path.stat().st_size:,} bytes")
-                    return out_path
-                logger.error(f"❌ [{label}] Output kosong atau tidak ditemukan: {out_path}")
-                return None
-            except Exception as exc:
-                logger.error(f"❌ [{label}] Exception: {exc}")
-                return None
-
         try:
             logger.info(f"💬 Embedding softsub: {subtitle_path.name} → {video_path.name}")
 
@@ -196,7 +170,6 @@ class VideoProcessor:
                 logger.error(f"❌ Subtitle not found: {subtitle_path}")
                 return video_path
 
-            # Fix encoding UTF-8 saja — JANGAN konversi ke ASS, mov_text tidak support ASS
             srt_path = await self._fix_encoding(subtitle_path)
             if srt_path.suffix.lower() == ".vtt":
                 converted = await self._convert_vtt_to_srt(srt_path)
@@ -204,8 +177,6 @@ class VideoProcessor:
                     srt_path = converted
 
             logger.info(f"💬 SRT ready: {srt_path.name}")
-
-            loop = asyncio.get_event_loop()
 
             # ── MP4 Method 1: metadata bahasa + disposition default ──────────
             cmd1 = [
@@ -224,9 +195,7 @@ class VideoProcessor:
                 "-movflags", MOVFLAGS,
                 str(output_path),
             ]
-            result = await loop.run_in_executor(
-                None, functools.partial(run_ffmpeg_sync, cmd1, "MP4-meta", output_path)
-            )
+            result = await self._run_ffmpeg(cmd1, video_path.parent, output_path, user_id)
             if result:
                 return result
 
@@ -244,9 +213,7 @@ class VideoProcessor:
                 "-movflags", MOVFLAGS,
                 str(output_path),
             ]
-            result = await loop.run_in_executor(
-                None, functools.partial(run_ffmpeg_sync, cmd2, "MP4-nometa", output_path)
-            )
+            result = await self._run_ffmpeg(cmd2, video_path.parent, output_path, user_id)
             if result:
                 return result
 
@@ -261,9 +228,7 @@ class VideoProcessor:
                 "-movflags", MOVFLAGS,
                 str(output_path),
             ]
-            result = await loop.run_in_executor(
-                None, functools.partial(run_ffmpeg_sync, cmd3, "MP4-nomap", output_path)
-            )
+            result = await self._run_ffmpeg(cmd3, video_path.parent, output_path, user_id)
             if result:
                 return result
 
@@ -284,9 +249,7 @@ class VideoProcessor:
                 "-disposition:s:0", "default",
                 str(mkv_output),
             ]
-            result = await loop.run_in_executor(
-                None, functools.partial(run_ffmpeg_sync, cmd4, "MKV-fallback", mkv_output)
-            )
+            result = await self._run_ffmpeg(cmd4, video_path.parent, mkv_output, user_id)
             if result:
                 return result
 
@@ -303,6 +266,7 @@ class VideoProcessor:
     # ------------------------------------------------------------------ #
     async def burn_subtitle(self, video_path: Path, subtitle_path: Path,
                             output_path: Path,
+                            user_id: int,
                             progress_callback: Optional[Callable] = None,
                             subtitle_lang: str = "id") -> Optional[Path]:
         """Burn subtitle ke video dengan fallback methods"""
@@ -337,7 +301,7 @@ class VideoProcessor:
 
             for method_func, method_name in methods:
                 logger.info(f"🎬 Trying {method_name}...")
-                result = await method_func(video_path, subtitle_path, output_path, progress_callback)
+                result = await method_func(video_path, subtitle_path, output_path, user_id, progress_callback)
                 if result and result.exists() and result.stat().st_size > 0:
                     logger.info(f"✅ {method_name} succeeded! {result.stat().st_size} bytes")
                     return result
@@ -377,7 +341,7 @@ class VideoProcessor:
             "-threads", str(FFMPEG_THREADS),
         ]
 
-    async def _burn_method_1(self, video_path, subtitle_path, output_path, cb):
+    async def _burn_method_1(self, video_path, subtitle_path, output_path, user_id, cb):
         """Method 1: subtitles filter dengan styling"""
         vf = (
             f"subtitles={subtitle_path.name}:"
@@ -390,9 +354,9 @@ class VideoProcessor:
             + self._common_encode_flags()
             + [str(output_path)]
         )
-        return await self._run_ffmpeg(cmd, video_path.parent, output_path, cb)
+        return await self._run_ffmpeg(cmd, video_path.parent, output_path, user_id, cb)
 
-    async def _burn_method_2(self, video_path, subtitle_path, output_path, cb):
+    async def _burn_method_2(self, video_path, subtitle_path, output_path, user_id, cb):
         """Method 2: subtitles filter, absolute path, no styling"""
         vf = f"subtitles={str(subtitle_path)}"
         cmd = (
@@ -400,9 +364,9 @@ class VideoProcessor:
             + self._common_encode_flags()
             + [str(output_path)]
         )
-        return await self._run_ffmpeg(cmd, video_path.parent, output_path, cb)
+        return await self._run_ffmpeg(cmd, video_path.parent, output_path, user_id, cb)
 
-    async def _burn_method_3(self, video_path, subtitle_path, output_path, cb):
+    async def _burn_method_3(self, video_path, subtitle_path, output_path, user_id, cb):
         """Method 3: ASS filter"""
         vf = f"ass={subtitle_path}"
         cmd = (
@@ -410,9 +374,9 @@ class VideoProcessor:
             + self._common_encode_flags()
             + [str(output_path)]
         )
-        return await self._run_ffmpeg(cmd, video_path.parent, output_path, cb)
+        return await self._run_ffmpeg(cmd, video_path.parent, output_path, user_id, cb)
 
-    async def _burn_method_4(self, video_path, subtitle_path, output_path, cb):
+    async def _burn_method_4(self, video_path, subtitle_path, output_path, user_id, cb):
         """Method 4: Copy codec + embed subtitle as mov_text track"""
         cmd = [
             "ffmpeg", "-y",
@@ -425,26 +389,56 @@ class VideoProcessor:
             "-threads", str(FFMPEG_THREADS),
             str(output_path)
         ]
-        return await self._run_ffmpeg(cmd, video_path.parent, output_path, cb)
+        return await self._run_ffmpeg(cmd, video_path.parent, output_path, user_id, cb)
+
+    def _run_ffmpeg_sync(self, cmd: list, label: str, output_path: Path) -> Optional[Path]:
+        """Runner FFmpeg sinkron untuk dipakai di loop.run_in_executor"""
+        try:
+            logger.info(f"▶ [{label}] {' '.join(cmd)}")
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore'
+            )
+            if result.returncode != 0:
+                logger.error(f"FFmpeg {label} error (rc={result.returncode}): {result.stderr[:500]}")
+                return None
+            
+            if output_path.exists() and output_path.stat().st_size > 0:
+                return output_path
+            return None
+        except Exception as e:
+            logger.error(f"_run_ffmpeg_sync {label} exception: {e}")
+            return None
 
     # ------------------------------------------------------------------ #
     #  FFmpeg runner                                                       #
     # ------------------------------------------------------------------ #
     async def _run_ffmpeg(self, cmd: list, cwd: Path, output_path: Path,
-                          progress_callback) -> Optional[Path]:
+                          user_id: int,
+                          progress_callback: Optional[Callable] = None) -> Optional[Path]:
         try:
             logger.info(f"▶ {' '.join(cmd)}")
             process = await asyncio.create_subprocess_exec(
                 *cmd,
-                cwd=str(cwd),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                cwd=str(cwd) if cwd else None,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
 
-            if progress_callback:
-                asyncio.create_task(self._monitor_progress(process, output_path, progress_callback))
+            if user_id and getattr(self, 'task_tracker', None):
+                self.task_tracker.register_process(user_id, process)
+            
+            try:
+                if progress_callback:
+                    asyncio.create_task(self._monitor_progress(process, output_path, progress_callback))
 
-            stdout, stderr = await process.communicate()
+                stdout, stderr = await process.communicate()
+            finally:
+                if user_id and getattr(self, 'task_tracker', None):
+                    self.task_tracker.unregister_process(user_id, process)
 
             if process.returncode != 0:
                 err = stderr.decode('utf-8', errors='ignore')[:500]
@@ -489,8 +483,8 @@ class VideoProcessor:
             ]
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
             stdout, _ = await proc.communicate()
             return float(stdout.decode().strip())
@@ -589,18 +583,9 @@ class VideoProcessor:
         """
         Generate laporan MediaInfo dari video menggunakan ffprobe,
         upload ke Telegraph sebagai halaman, dan kembalikan URL-nya.
-
-        Return: "https://telegra.ph/xxxx" atau None jika gagal.
-
-        CATATAN PENTING — Telegraph API /createPage:
-        - Harus kirim sebagai form-encoded (data=), BUKAN json=
-        - Field 'content' harus berupa JSON string (bukan dict)
-        - access_token adalah token akun Telegraph (bisa dibuat via /createAccount)
         """
-        import json as _json
-        import aiohttp as _aiohttp
-
         try:
+            filename = video_path.name
             if not video_path.exists():
                 logger.warning(f"⚠️ MediaInfo: file tidak ada: {video_path}")
                 return None
@@ -784,36 +769,87 @@ class VideoProcessor:
             page_title  = f"MediaInfo — {filename}"
 
             # Ambil token valid (auto-create jika belum ada)
-            token = await self._get_telegraph_token(_aiohttp)
+            token = await self._get_telegraph_token()
             if not token:
                 logger.error("❌ Tidak bisa mendapatkan Telegraph token")
                 return None
 
-            form_data = _aiohttp.FormData()
+            form_data = aiohttp.FormData()
             form_data.add_field("access_token",   token)
             form_data.add_field("title",           page_title)
             form_data.add_field("content",         content_str)
             form_data.add_field("return_content",  "false")
 
-            async with _aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.post(
                     "https://api.telegra.ph/createPage",
-                    data=form_data,
-                    timeout=_aiohttp.ClientTimeout(total=20)
+                    data=form_data
                 ) as resp:
-                    result = await resp.json(content_type=None)
-
-            if result.get("ok"):
-                url = "https://telegra.ph/" + result["result"]["path"]
-                logger.info(f"✅ MediaInfo page: {url}")
-                return url
-            else:
-                logger.error(f"❌ Telegraph error: {result.get('error', result)}")
-                return None
-
+                    res_json = await resp.json()
+                    if res_json.get("ok"):
+                        url = res_json["result"]["url"]
+                        logger.info(f"✅ MediaInfo Telegraph page created: {url}")
+                        return url
+                    else:
+                        logger.error(f"Telegraph API error: {res_json}")
+                        return None
         except Exception as e:
-            logger.error(f"❌ generate_mediainfo_report error: {e}")
+            logger.error(f"generate_mediainfo_report failed: {e}")
             return None
+
+    async def get_detailed_mediainfo_string(self, video_path: Path) -> str:
+        """
+        Get media info as a formatted string for Telegram message.
+        """
+        import json as _json
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams", "-show_format",
+                str(video_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await proc.communicate()
+            data = _json.loads(stdout.decode("utf-8", errors="ignore"))
+            fmt = data.get("format", {})
+            streams = data.get("streams", [])
+            
+            video = next((s for s in streams if s.get("codec_type") == "video"), {})
+            audio = next((s for s in streams if s.get("codec_type") == "audio"), {})
+            subs = [s for s in streams if s.get("codec_type") == "subtitle"]
+            
+            def _format_size(b):
+                b = int(b)
+                if b >= 1024**3: return f"{b/1024**3:.2f} GB"
+                return f"{b/1024**2:.2f} MB"
+
+            def _format_dur(s):
+                s = float(s)
+                m, sc = divmod(int(s), 60)
+                h, m = divmod(m, 60)
+                return f"{h:02d}:{m:02d}:{sc:02d}"
+
+            info = (
+                f"📊 <b>MEDIA INFO</b>\n\n"
+                f"📦 <b>File Size:</b> {_format_size(fmt.get('size', 0))}\n"
+                f"⏱ <b>Duration:</b> {_format_dur(fmt.get('duration', 0))}\n"
+                f"📺 <b>Resolution:</b> {video.get('width', 'N/A')}x{video.get('height', 'N/A')}\n"
+                f"🎞 <b>Codec:</b> {video.get('codec_name', 'N/A').upper()}\n"
+                f"⚡️ <b>Bitrate:</b> {int(fmt.get('bit_rate', 0))//1000} kbps\n"
+            )
+            
+            if subs:
+                langs = [s.get("tags", {}).get("language", "und") for s in subs]
+                info += f"💬 <b>Subtitle Language:</b> {', '.join(langs).upper()}\n"
+            else:
+                info += f"💬 <b>Subtitle:</b> None\n"
+                
+            return info
+        except Exception as e:
+            logger.error(f"get_detailed_mediainfo_string error: {e}")
+            return f"❌ Error getting media info: {str(e)}"
 
     # ------------------------------------------------------------------ #
     #  TELEGRAPH TOKEN – Auto-create & cache                               #
@@ -821,7 +857,7 @@ class VideoProcessor:
     _telegraph_token: Optional[str] = None
     _TELEGRAPH_TOKEN_FILE = Path("telegraph_token.txt")
 
-    async def _get_telegraph_token(self, aiohttp_module) -> Optional[str]:
+    async def _get_telegraph_token(self) -> Optional[str]:
         """
         Kembalikan Telegraph access_token yang valid.
         Urutan prioritas:
@@ -845,14 +881,14 @@ class VideoProcessor:
         # 3. Buat akun baru
         logger.info("⚙️ Membuat Telegraph account baru...")
         try:
-            async with aiohttp_module.ClientSession() as session:
+            async with aiohttp.ClientSession() as session:
                 async with session.get(
                     "https://api.telegra.ph/createAccount",
                     params={
                         "short_name":  "MediaInfoBot",
                         "author_name": "MediaInfo Bot",
                     },
-                    timeout=aiohttp_module.ClientTimeout(total=15)
+                    timeout=aiohttp.ClientTimeout(total=15)
                 ) as resp:
                     data = await resp.json(content_type=None)
 

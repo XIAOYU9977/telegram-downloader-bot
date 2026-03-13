@@ -54,6 +54,8 @@ class HLSStreamInfo:
         # Setiap item: {"label": "1080p", "url": "...", "bandwidth": 12345, "resolution": "1920x1080"}
         self.variants: List[Dict] = []
 
+from task_tracker import TaskTracker
+
 class OptimizedHLSDownloader:
     """
     HLS Downloader dengan FIX DURASI VIDEO:
@@ -66,10 +68,11 @@ class OptimizedHLSDownloader:
     - Subtitle handling
     """
     
-    def __init__(self):
+    def __init__(self, task_tracker: Optional[TaskTracker] = None):
         self._session: Optional[aiohttp.ClientSession] = None
         self._temp_dirs: List[Path] = []
         self._playlist_cache: Dict[str, Tuple[str, float]] = {}  # url -> (content, timestamp)
+        self.task_tracker = task_tracker
         
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create aiohttp session dengan headers yang sesuai"""
@@ -535,6 +538,7 @@ class OptimizedHLSDownloader:
     async def _merge_fmp4_segments(self, segments: List[Path], output_path: Path,
                                     audio_segments: Optional[List[Path]],
                                     progress_callback: Optional[Callable],
+                                    user_id: Optional[int] = None,
                                     output_format: str = "mp4") -> Optional[Path]:
         """
         Merge fragmented MP4 (fMP4) segments dengan 4 strategi fallback:
@@ -569,11 +573,17 @@ class OptimizedHLSDownloader:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
-                if progress_callback:
-                    asyncio.create_task(self._monitor_ffmpeg_progress(
-                        proc, output_path, progress_callback
-                    ))
-                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                if user_id and self.task_tracker:
+                    self.task_tracker.register_process(user_id, proc)
+                try:
+                    if progress_callback:
+                        asyncio.create_task(self._monitor_ffmpeg_progress(
+                            proc, output_path, progress_callback
+                        ))
+                    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                finally:
+                    if user_id and getattr(self, 'task_tracker', None):
+                        self.task_tracker.unregister_process(user_id, proc)
                 if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
                     size_mb = output_path.stat().st_size / (1024 * 1024)
                     logger.info(f"✅ [fMP4] {label} OK: {size_mb:.2f} MB")
@@ -778,6 +788,7 @@ class OptimizedHLSDownloader:
 
     async def download_stream(self, stream_info: HLSStreamInfo,
                              output_path: Path,
+                             user_id: int,
                              progress_callback: Optional[Callable] = None,
                              burn_subtitle: bool = False,
                              subtitle_url: Optional[str] = None,
@@ -798,10 +809,11 @@ class OptimizedHLSDownloader:
 
             logger.info(f"📥 Downloading {len(stream_info.video_segments)} video segments...")
             video_ts = await self._download_segments_parallel(
-                stream_info.video_segments,
-                temp_dir / "video",
-                "video",
-                progress_callback
+                segments=stream_info.video_segments,
+                temp_dir=temp_dir / "video",
+                label="video",
+                progress_callback=progress_callback,
+                user_id=user_id
             )
             if not video_ts:
                 logger.error("Failed to download video segments")
@@ -812,10 +824,11 @@ class OptimizedHLSDownloader:
             if stream_info.audio_segments:
                 logger.info(f"🎵 Downloading {len(stream_info.audio_segments)} audio segments...")
                 audio_ts = await self._download_segments_parallel(
-                    stream_info.audio_segments,
-                    temp_dir / "audio",
-                    "audio",
-                    None
+                    segments=stream_info.audio_segments,
+                    temp_dir=temp_dir / "audio",
+                    label="audio",
+                    progress_callback=None,
+                    user_id=user_id
                 )
                 if not audio_ts:
                     logger.warning("Audio segments gagal didownload, lanjut tanpa audio terpisah")
@@ -876,9 +889,15 @@ class OptimizedHLSDownloader:
                     proc = await asyncio.create_subprocess_exec(
                         *cmd_b, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                     )
-                    if progress_callback:
-                        asyncio.create_task(self._monitor_ffmpeg_progress(proc, temp_output, progress_callback))
-                    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                    if user_id and getattr(self, 'task_tracker', None):
+                        self.task_tracker.register_process(user_id, proc)
+                    try:
+                        if progress_callback:
+                            asyncio.create_task(self._monitor_ffmpeg_progress(proc, temp_output, progress_callback))
+                        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                    finally:
+                        if user_id and getattr(self, 'task_tracker', None):
+                            self.task_tracker.unregister_process(user_id, proc)
                     if proc.returncode != 0 or not temp_output.exists() or temp_output.stat().st_size == 0:
                         logger.warning("TS merge+audio failed, retry video-only...")
                         if temp_output.exists():
@@ -897,9 +916,15 @@ class OptimizedHLSDownloader:
                     proc = await asyncio.create_subprocess_exec(
                         *cmd_a, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                     )
-                    if progress_callback:
-                        asyncio.create_task(self._monitor_ffmpeg_progress(proc, temp_output, progress_callback))
-                    await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                    if user_id and getattr(self, 'task_tracker', None):
+                        self.task_tracker.register_process(user_id, proc)
+                    try:
+                        if progress_callback:
+                            asyncio.create_task(self._monitor_ffmpeg_progress(proc, temp_output, progress_callback))
+                        await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                    finally:
+                        if user_id and getattr(self, 'task_tracker', None):
+                            self.task_tracker.unregister_process(user_id, proc)
 
                 if not temp_output.exists() or temp_output.stat().st_size == 0:
                     # Fallback: copy-only merge tanpa re-encode
@@ -913,7 +938,13 @@ class OptimizedHLSDownloader:
                     proc = await asyncio.create_subprocess_exec(
                         *cmd_copy, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
                     )
-                    _, stderr_copy = await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                    if user_id and getattr(self, 'task_tracker', None):
+                        self.task_tracker.register_process(user_id, proc)
+                    try:
+                        _, stderr_copy = await asyncio.wait_for(proc.communicate(), timeout=PROCESSING_TIMEOUT)
+                    finally:
+                        if user_id and getattr(self, 'task_tracker', None):
+                            self.task_tracker.unregister_process(user_id, proc)
                     if not temp_output.exists() or temp_output.stat().st_size == 0:
                         logger.error(f"Failed to create video (TS path) — copy-only also failed")
                         if stderr_copy:
@@ -957,84 +988,61 @@ class OptimizedHLSDownloader:
             except:
                 pass
 
-    async def _download_segments_parallel(self, segments: List[str], 
-                                         output_dir: Path,
-                                         prefix: str,
-                                         progress_callback: Optional[Callable]) -> List[Path]:
+    async def _download_segments_parallel(self, segments: List[str], temp_dir: Path, 
+                                         label: str, progress_callback: Optional[Callable],
+                                         user_id: Optional[int] = None) -> List[Path]:
         """
         Download segmen secara paralel dengan retry mechanism
         """
-        output_dir.mkdir(parents=True, exist_ok=True)
-        downloaded = []
-        failed_count = 0
+        if not temp_dir.exists():
+            temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # Buat semaphore untuk membatasi concurrency
-        sem = asyncio.Semaphore(SEGMENT_CONCURRENCY)
+        downloaded_paths = []
+        semaphore = asyncio.Semaphore(SEGMENT_CONCURRENCY)
         session = await self._get_session()
         
-        async def download_one(index: int, url: str):
-            nonlocal failed_count
-            async with sem:
-                # Deteksi ekstensi dari URL agar fMP4 (.m4s) tidak disimpan sebagai .ts
-                url_path = url.split("?")[0].lower()
-                if url_path.endswith(".m4s") or url_path.endswith(".mp4"):
-                    ext = ".m4s"
-                elif url_path.endswith(".aac") or url_path.endswith(".m4a"):
-                    ext = ".m4a"
-                else:
-                    ext = ".ts"
-                output_file = output_dir / f"{prefix}_{index:06d}{ext}"
+        async def _download_one(url: str, index: int) -> Optional[Path]:
+            # Deteksi ekstensi
+            url_path = url.split("?")[0].lower()
+            if url_path.endswith(".m4s") or url_path.endswith(".mp4"):
+                ext = ".m4s"
+            elif url_path.endswith(".aac") or url_path.endswith(".m4a"):
+                ext = ".m4a"
+            else:
+                ext = ".ts"
                 
+            file_name = f"{label}_{index:05d}{ext}"
+            target_path = temp_dir / file_name
+            
+            async with semaphore:
                 for attempt in range(MAX_SEGMENT_RETRIES):
                     try:
+                        # Fallback ke aria2c jika download direct sering gagal
+                        # Namun untuk segment kecil, aiohttp lebih efisien
                         headers = self._build_headers(url)
-                        
                         async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=SEGMENT_TIMEOUT)) as resp:
                             if resp.status == 200:
                                 content = await resp.read()
                                 if content:
-                                    async with aiofiles.open(output_file, 'wb') as f:
+                                    async with aiofiles.open(target_path, 'wb') as f:
                                         await f.write(content)
-                                    
-                                    # Update progress
-                                    if progress_callback and index % 5 == 0:
-                                        downloaded_count = len([p for p in output_dir.glob(f"{prefix}_*")])
-                                        try:
-                                            await progress_callback(downloaded_count, len(segments))
-                                        except:
-                                            pass
-                                    
-                                    return output_file
+                                    return target_path
                             elif resp.status in [401, 403] and attempt < MAX_SEGMENT_RETRIES - 1:
-                                logger.debug(f"Token expired for segment {index}, refreshing...")
                                 await asyncio.sleep(1)
                                 continue
-                    except asyncio.TimeoutError:
-                        logger.debug(f"Timeout segment {index}, attempt {attempt+1}")
-                        if attempt < MAX_SEGMENT_RETRIES - 1:
-                            await asyncio.sleep(1)
+                        await asyncio.sleep(1)
                     except Exception as e:
-                        logger.debug(f"Error segment {index}: {e}")
-                        if attempt < MAX_SEGMENT_RETRIES - 1:
-                            await asyncio.sleep(1)
-                        else:
-                            failed_count += 1
-                
+                        logger.warning(f"Segment download error (attempt {attempt+1}): {e}")
+                        await asyncio.sleep(1)
                 return None
+
+        tasks = [_download_one(url, i) for i, url in enumerate(segments)]
+        results = await asyncio.gather(*tasks)
         
-        # Create tasks for all segments
-        tasks = [download_one(i, url) for i, url in enumerate(segments)]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        downloaded_paths = [r for r in results if isinstance(r, Path) and r.exists()]
+        logger.info(f"✅ {label}: Downloaded {len(downloaded_paths)}/{len(segments)} segments")
         
-        # Filter successful downloads
-        downloaded = [r for r in results if isinstance(r, Path) and r.exists()]
-        
-        if failed_count > len(segments) * 0.2:  # More than 20% failed
-            logger.error(f"Too many failed segments: {failed_count}/{len(segments)}")
-            return []
-        
-        logger.info(f"Downloaded {len(downloaded)}/{len(segments)} {prefix} segments")
-        return downloaded
+        return downloaded_paths
 
     async def _merge_segments(self, segments: List[Path], output_file: Path) -> bool:
         """Merge TS segments using ffmpeg concat"""

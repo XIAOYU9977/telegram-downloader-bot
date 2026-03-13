@@ -12,6 +12,7 @@ from telegram.ext import (
 )
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 import aiofiles
+import aiohttp
 
 from config import (
     BOT_TOKEN, DOWNLOAD_DIR, ALLOWED_USERS, DELETE_AFTER_UPLOAD,
@@ -27,6 +28,7 @@ from utils import (
     JSONParser, SubtitleDetector, FileCleanup,
     cleanup_file, format_size, logger
 )
+from task_tracker import TaskTracker
 
 # Conversation states
 AWAITING_CONFIRMATION        = 0
@@ -39,11 +41,13 @@ AWAITING_FORMAT_CHOICE       = 6   # Memilih format MKV atau MP4
 
 class DownloaderBot:
     def __init__(self):
-        self.download_manager = DownloadManager()
-        self.video_processor = VideoProcessor()
-        self.uploader: Optional[TelegramUploader] = None
+        self.task_tracker = TaskTracker()
+        self.download_manager = DownloadManager(self.task_tracker)
+        self.video_processor = VideoProcessor(self.task_tracker)
+        self.uploader = TelegramUploader(BOT_TOKEN)
         self.session_manager = SessionManager()
         self.cleanup = FileCleanup()
+        self.download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
         
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command"""
@@ -279,7 +283,7 @@ class DownloaderBot:
                     text=f"📥 <b>Download dimulai</b>\n"
                          f"🎬 <b>Judul:</b> {user_title}\n"
                          f"📦 <b>Format:</b> {sel_fmt.upper()} | <b>Kualitas:</b> {sel_res}\n"
-                         f"⏳ Mengunduh segmen video...",
+                         f"⏳ Menyiapkan download...",
                     parse_mode="HTML"
                 )
 
@@ -437,7 +441,13 @@ class DownloaderBot:
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Cancel current operation and cleanup ALL files — works from any state"""
         user_id = update.effective_user.id
+        
+        # 1. Cancel active tasks & subprocesses
+        await self.task_tracker.cancel_all(user_id)
+        
+        # 2. Cleanup session & files
         await self._cleanup_user_session(user_id, context, "dibatalkan oleh user (/cancel)")
+        
         await update.message.reply_text(
             "✅ *Semua proses dibatalkan.*\n"
             "🧹 Session & file telah dibersihkan.",
@@ -514,6 +524,17 @@ class DownloaderBot:
                     if first_ep.get("zimu"):
                         has_subtitle = True
                 return title, episode, has_subtitle
+
+            # Dramaflickreels format
+            if "drama" in data and "episodes" in data:
+                drama_info = data["drama"]
+                title = drama_info.get("title", "Drama")
+                eps_list = data.get("episodes", [])
+                if eps_list:
+                    first = eps_list[0]
+                    raw = first.get("raw", {})
+                    episode = str(raw.get("chapter_num", first.get("index", 0) + 1))
+                return title, episode, False
 
             # Dramabox v2 format
             if "data" in data and "bookName" in data["data"]:
@@ -883,6 +904,9 @@ class DownloaderBot:
         if ALLOWED_USERS and user_id not in ALLOWED_USERS:
             await update.message.reply_text("⛔ Anda tidak diizinkan menggunakan bot ini.")
             return ConversationHandler.END
+            
+        if not self.uploader:
+            self.uploader = TelegramUploader(context.bot)
         
         # Cek session aktif
         if self.session_manager.has_active_session(user_id):
@@ -893,11 +917,16 @@ class DownloaderBot:
             return ConversationHandler.END
         
         json_path = None
+        url_fetched_path = context.user_data.pop('url_fetched_path', None)
+        
         try:
-            file = await update.message.document.get_file()
-            filename = update.message.document.file_name or ""
-            json_path = DOWNLOAD_DIR / f"{user_id}_{uuid.uuid4()}.json"
-            await file.download_to_drive(json_path)
+            if url_fetched_path:
+                json_path = Path(url_fetched_path)
+            else:
+                file = await update.message.document.get_file()
+                filename = update.message.document.file_name or ""
+                json_path = DOWNLOAD_DIR / f"{user_id}_{uuid.uuid4()}.json"
+                await file.download_to_drive(json_path)
             
             data = await JSONParser.parse_json_file(json_path)
             if not data:
@@ -1058,22 +1087,35 @@ class DownloaderBot:
                     return AWAITING_BATCH_CHOICE
             # ── End dramawave ─────────────────────────────────────────────────
 
-            # Parse video & subtitle URL untuk format non-dramawave, non-velolo
-            result = JSONParser.extract_video_url(data)
-            video_url, subtitle_url = result if result else (None, None)
+            # ── Gunakan Universal Parser ──────────────────────────────────────
+            universal_data = JSONParser.universal_parse(data)
+            video_url = universal_data.get("url")
+            subtitle_url = universal_data.get("subtitle_url")
+            all_episodes = universal_data.get("all_episodes", [])
+            drama_title = universal_data.get("title", "Video")
+            cover_url = universal_data.get("cover_url")
+
+            if cover_url:
+                try:
+                    await update.message.reply_photo(
+                        photo=cover_url,
+                        caption=f"🎬 <b>{drama_title}</b>",
+                        parse_mode="HTML"
+                    )
+                    logger.info(f"JSON Cover sent: {drama_title}")
+                except Exception as cover_err:
+                    logger.warning(f"Failed to send JSON cover: {cover_err}")
 
             if subtitle_url:
                 logger.info(f"Indonesian subtitle detected: {subtitle_url[:100]}...")
             
-            if not video_url:
+            if not video_url and not all_episodes:
                 await update.message.reply_text(
-                    "❌ Tidak dapat menemukan URL video dalam file JSON.\n"
-                    "Pastikan format JSON didukung."
+                    "❌ Tidak dapat menemukan URL video (MP4/M3U8) dalam file JSON ini.\n\n"
+                    "Pastikan JSON berisi field seperti: <code>url, stream_url, m3u8, mp4, play_url</code>"
                 )
-                await self._cleanup_user_session(user_id, context, "tidak ada URL video")
+                await self._cleanup_user_session(user_id, context, "URL tidak ditemukan")
                 return ConversationHandler.END
-            
-            all_episodes = JSONParser.extract_all_episodes(data)
             
             if not all_episodes:
                 title, episode, has_subtitle = self.extract_title_episode(data, filename)
@@ -1164,11 +1206,107 @@ class DownloaderBot:
                 await update.message.reply_text(choice_text, parse_mode="HTML")
                 return AWAITING_BATCH_CHOICE
             
+            return ConversationHandler.END
+            
         except Exception as e:
             logger.error(f"Error handling JSON file: {e}")
             await self._cleanup_user_session(user_id, context, f"error: {str(e)}")
             await update.message.reply_text(f"❌ Error: {str(e)}")
             return ConversationHandler.END
+
+    async def handle_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle JSON URL directly"""
+        user_id = update.effective_user.id
+        url = update.message.text.strip()
+        
+        if not url.startswith(('http://', 'https://')):
+            return
+            
+        if self.session_manager.has_active_session(user_id):
+            await update.message.reply_text("⚠️ Masih ada proses berjalan.")
+            return
+
+        status_msg = await update.message.reply_text("🌐 <b>Menganalisa URL...</b>", parse_mode="HTML")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status != 200:
+                        await status_msg.edit_text(f"❌ Gagal fetch URL: HTTP {resp.status}")
+                        return
+                    
+                    try:
+                        data = await resp.json()
+                    except:
+                        # Mungkin ini .json file link tapi response type bukan json
+                        content = await resp.text()
+                        import json
+                        data = json.loads(content)
+            
+            # Simpan ke temp file agar kompatibel dengan handle_json_file
+            json_path = DOWNLOAD_DIR / f"{user_id}_{uuid.uuid4()}.json"
+            async with aiofiles.open(json_path, 'w', encoding='utf-8') as f:
+                import json
+                await f.write(json.dumps(data))
+            
+            # Bungkus sebagai document mock untuk reusable logic
+            class MockDoc:
+                def __init__(self, path, name):
+                    self.file_name = name
+                    self.path = path
+                async def get_file(self):
+                    class MockFile:
+                        def __init__(self, p): self.p = p
+                        async def download_to_drive(self, target): pass # sudah ada
+                    return MockFile(self.path)
+
+            update.message.document = MockDoc(json_path, "api_response.json")
+            # Jalankan handle_json_file (perlu penyesuaian sedikit agar tidak re-download)
+            # Tapi cara termudah adalah panggil logic-nya langsung atau copy-paste
+            # Mari kita panggil handle_json_file tapi bypass download part.
+            
+            # Re-implementing handle_json_file logic here for simplicity & custom URL source
+            self.session_manager.create_session(user_id, data, str(json_path))
+            
+            # Use universal parser to detect if it's a streaming JSON
+            results = JSONParser.universal_parse(data)
+            if results['videos']:
+                logger.info(f"Universal parser found {len(results['videos'])} videos and {len(results['subtitles'])} subtitles")
+                # Jika universal parser menemukan sesuatu, kita prioritaskan itu
+                # (Logic ini bisa diperluas untuk otomatisasi lebih lanjut)
+            
+            # Continue with existing logic
+            await status_msg.delete()
+            return await self.handle_json_file(update, context, api_data=data, api_path=json_path)
+            
+        except Exception as e:
+            logger.error(f"URL handle error: {e}")
+            await status_msg.edit_text(f"❌ Error: {str(e)}")
+
+    async def handle_callback_mi(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle MEDIA INFO button click"""
+        query = update.callback_query
+        await query.answer()
+        
+        _, filename = query.data.split("|")
+        video_path = DOWNLOAD_DIR / filename
+        
+        if not video_path.exists():
+            await query.answer("❌ File sudah dihapus dari server.", show_alert=True)
+            return
+            
+        info = await self.video_processor.get_detailed_mediainfo_string(video_path)
+        
+        keyboard = [[InlineKeyboardButton("❌ Tutup", callback_data="close_mi")]]
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=info,
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+
+    async def handle_close_mi(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await update.callback_query.message.delete()
     
     async def handle_batch_choice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle user's choice for batch download"""
@@ -1295,7 +1433,16 @@ class DownloaderBot:
             return ConversationHandler.END
     
     async def process_video(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle confirmation and start processing (single or batch)"""
+        """Handle confirmation and start processing with global concurrency limit"""
+        user_id = update.effective_user.id
+        
+        # Concurrency Limiter: Wait for slot if 2 users already downloading
+        async with self.download_semaphore:
+            logger.info(f"🟢 User {user_id} acquired download slot")
+            return await self._process_video_locked(update, context)
+
+    async def _process_video_locked(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Internal processing after semaphore acquisition"""
         user_id = update.effective_user.id
         confirmation = update.message.text.strip().upper()
         
@@ -1353,26 +1500,37 @@ class DownloaderBot:
                 except:
                     pass
                 
+                # Isolated user folder
+                user_dir = DOWNLOAD_DIR / f"user_{user_id}"
+                user_dir.mkdir(parents=True, exist_ok=True)
+                
                 safe_title = "".join(c for c in drama_title if c.isalnum() or c in ' ._-')[:30]
                 safe_episode = f"EP{episode_num.zfill(2) if episode_num.isdigit() else episode_num}"
                 user_fmt = context.user_data.get("default_format", "mp4").lower()
                 user_res = context.user_data.get("default_resolution", "1080p")
-                video_path = DOWNLOAD_DIR / f"{user_id}_{safe_title}_{safe_episode}.{user_fmt}"
-                subtitle_path = DOWNLOAD_DIR / f"{user_id}_{safe_title}_{safe_episode}.srt"
-                output_path = DOWNLOAD_DIR / f"{user_id}_{safe_title}_{safe_episode}_sub.{user_fmt}"
+                
+                video_path = user_dir / f"{safe_title}_{safe_episode}.{user_fmt}"
+                subtitle_path = user_dir / f"{safe_title}_{safe_episode}.srt"
+                output_path = user_dir / f"{safe_title}_{safe_episode}_sub.{user_fmt}"
                 
                 episode_files = [video_path, subtitle_path, output_path]
                 all_files_to_cleanup.extend(episode_files)
                 
                 try:
-                    async def video_progress(current):
+                    async def video_progress(current, total=None, speed=None, eta=None):
                         if not is_batch:
                             try:
-                                await self.uploader.update_message(
+                                bar = JSONParser.get_progress_bar(current/total*100 if total else 0)
+                                speed_str = JSONParser.format_speed(speed) if speed else "N/A"
+                                eta_str = str(eta) if eta else "N/A"
+                                
+                                await self._safe_update(
                                     user_id,
-                                    status_msg.message_id,
-                                    f"⬇️ <b>Downloading Episode {episode_num}...</b>\n"
-                                    f"Size: {format_size(current)}"
+                                    status_msg,
+                                    f"⬇️ <b>Downloading Episode {episode_num}...</b>\n\n"
+                                    f"<code>{bar}</code>\n"
+                                    f"🚀 <b>Speed:</b> {speed_str}\n"
+                                    f"⏳ <b>ETA:</b> {eta_str}"
                                 )
                             except:
                                 pass
@@ -1380,9 +1538,10 @@ class DownloaderBot:
                     # Gunakan download manager yang sudah di-update dengan HLS optimization
                     downloaded_video = await asyncio.wait_for(
                         self.download_manager.download_video(
-                            video_url, 
-                            video_path, 
-                            video_progress if not is_batch else None,
+                            url=video_url, 
+                            output_path=video_path,
+                            user_id=user_id,
+                            progress_callback=video_progress if not is_batch else None,
                             subtitle_mode="none",
                             target_resolution=user_res,
                             output_format=user_fmt
@@ -1454,7 +1613,7 @@ class DownloaderBot:
                             )
                             processed_video = await asyncio.wait_for(
                                 self.video_processor.embed_softsub(
-                                    downloaded_video, subtitle_file, output_path
+                                    downloaded_video, subtitle_file, output_path, user_id
                                 ),
                                 timeout=PROCESSING_TIMEOUT
                             )
@@ -1491,7 +1650,7 @@ class DownloaderBot:
                             
                             processed_video = await asyncio.wait_for(
                                 self.video_processor.burn_subtitle(
-                                    downloaded_video, subtitle_file, output_path, burn_progress, "id"
+                                    downloaded_video, subtitle_file, output_path, user_id, burn_progress, "id"
                                 ),
                                 timeout=PROCESSING_TIMEOUT
                             )
@@ -1537,14 +1696,15 @@ class DownloaderBot:
                 logger.info(f"Final video size: {file_size_mb:.2f} MB")
 
                 # ── Generate MediaInfo sebelum upload ─────────────────
-                mi_markup = None
+                mi_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📊 MEDIA INFO", callback_data=f"mi|{final_video.name}")]
+                ])
                 try:
                     mi_url = await self.video_processor.generate_mediainfo_report(final_video)
                     if mi_url:
-                        mi_markup = InlineKeyboardMarkup([
-                            [InlineKeyboardButton("📊 MediaInfo", url=mi_url)]
-                        ])
+                        mi_markup.inline_keyboard.append([InlineKeyboardButton("📈 Full Report", url=mi_url)])
                 except Exception as mi_err:
+                    logger.warning(f"[mediainfo] Gagal generate report: {mi_err}")
                     logger.warning(f"[mediainfo] Gagal generate report: {mi_err}")
                 
                 try:
@@ -1571,12 +1731,12 @@ class DownloaderBot:
                         reply_markup=mi_markup
                     )
 
-                    if not upload_ok:
-                        failed += 1
+                    if upload_ok:
+                        successful = (successful or 0) + 1
+                    else:
+                        failed = (failed or 0) + 1
                         logger.error(f"Upload gagal ep {episode_num}")
                         continue
-                    
-                    successful += 1
                     
                     # ── Kirim subtitle terpisah jika mode separate ────
                     if ep_subtitle_mode == "separate" and subtitle_file and subtitle_file.exists():
@@ -1597,8 +1757,8 @@ class DownloaderBot:
                     # Update status progress
                     try:
                         progress_text = (
-                            f"✅ <b>Progress: {idx}/{len(selected_episodes)}</b>\n"
-                            f"Episode {episode_num} selesai"
+                            f"✅ <b>Selesai: {idx}/{len(selected_episodes)}</b>\n"
+                            f"🎬 <b>{drama_title} Ep {episode_num}</b>"
                         ) if is_batch else (
                             f"✅ <b>Upload selesai</b>\n\n"
                             f"🎬 {drama_title} Ep {episode_num}"
@@ -2296,9 +2456,10 @@ class DownloaderBot:
 
                     downloaded_video = await asyncio.wait_for(
                         self.download_manager.download_video(
-                            video_url,
-                            video_path,
-                            video_progress if not is_batch else None,
+                            url=video_url,
+                            output_path=video_path,
+                            user_id=user_id,
+                            progress_callback=video_progress if not is_batch else None,
                             subtitle_mode="none",
                             target_resolution=user_res,
                             output_format=user_fmt
@@ -2368,7 +2529,7 @@ class DownloaderBot:
                             )
                             processed_video = await asyncio.wait_for(
                                 self.video_processor.embed_softsub(
-                                    downloaded_video, subtitle_file, output_path
+                                    downloaded_video, subtitle_file, output_path, user_id
                                 ),
                                 timeout=PROCESSING_TIMEOUT
                             )
@@ -2404,7 +2565,7 @@ class DownloaderBot:
 
                             processed_video = await asyncio.wait_for(
                                 self.video_processor.burn_subtitle(
-                                    downloaded_video, subtitle_file, output_path, burn_progress, "id"
+                                    downloaded_video, subtitle_file, output_path, user_id, burn_progress, "id"
                                 ),
                                 timeout=PROCESSING_TIMEOUT
                             )
@@ -2638,6 +2799,7 @@ class DownloaderBot:
                     self.download_manager.download_video(
                         url=raw_url,
                         output_path=video_path,
+                        user_id=user_id,
                         progress_callback=dl_progress,
                         subtitle_mode=subtitle_mode,
                         subtitle_url=subtitle_url if subtitle_mode in ["embed", "separate"] else None,
@@ -2712,7 +2874,7 @@ class DownloaderBot:
                         )
                         softsub_out = output_path.with_suffix('.softsub.mp4')
                         processed = await self.video_processor.embed_softsub(
-                            downloaded_path, subtitle_path, softsub_out
+                            downloaded_path, subtitle_path, softsub_out, user_id
                         )
                         if processed:
                             downloaded_path = processed
@@ -2726,7 +2888,7 @@ class DownloaderBot:
                             f"{batch_header}🔥 <b>Burning hardsub:</b> {display_title}..."
                         )
                         processed = await self.video_processor.burn_subtitle(
-                            downloaded_path, subtitle_path, output_path, None, "id"
+                            downloaded_path, subtitle_path, output_path, user_id, None, "id"
                         )
                         if processed:
                             downloaded_path = processed
@@ -2950,6 +3112,99 @@ class DownloaderBot:
             self.session_manager.force_cleanup_session(user_id)
             asyncio.create_task(FileCleanup.cleanup_old_files(DOWNLOAD_DIR, minutes=5))
             logger.info(f"[batch] Selesai user {user_id}: {successful}/{total} OK")
+    
+    async def handle_url(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle direct JSON URLs."""
+        user_id = update.effective_user.id
+        url = update.message.text.strip()
+        
+        if not url.startswith(("http://", "https://")):
+            return
+            
+        status_msg = await update.message.reply_text("🌐 <b>Mengambil data dari URL...</b>", parse_mode="HTML")
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status != 200:
+                        await status_msg.edit_text(f"❌ <b>Gagal mengambil data (HTTP {resp.status})</b>", parse_mode="HTML")
+                        return
+                    data = await resp.json()
+            
+            # Save to temp file
+            temp_path = DOWNLOAD_DIR / f"{user_id}_temp_{uuid.uuid4().hex[:6]}.json"
+            async with aiofiles.open(temp_path, 'w', encoding='utf-8') as f:
+                import json as _json
+                await f.write(_json.dumps(data))
+            
+            # Spoof a document update for handle_json_file
+            from types import SimpleNamespace
+            update.message.document = SimpleNamespace(file_id='url_fetched', file_name='url_data.json')
+            # We need to bypass the actual download in handle_json_file if it's from URL
+            context.user_data['url_fetched_path'] = str(temp_path)
+            
+            return await self.handle_json_file(update, context)
+            
+        except Exception as e:
+            logger.error(f"Error fetching URL: {e}")
+            await status_msg.edit_text(f"❌ <b>Error:</b> {str(e)}", parse_mode="HTML")
+
+    async def handle_callback_mi(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle MediaInfo button click."""
+        query = update.callback_query
+        await query.answer()
+        
+        # mi|filename
+        _, filename = query.data.split("|", 1)
+        file_path = DOWNLOAD_DIR / filename
+        
+        if not file_path.exists():
+            await query.edit_message_caption(
+                caption=query.message.caption + "\n\n⚠️ <i>File MediaInfo sudah tidak tersedia di server.</i>",
+                parse_mode="HTML"
+            )
+            return
+            
+        try:
+            info_str = await self.video_processor.get_detailed_mediainfo_string(file_path)
+            
+            # Add close button
+            markup = InlineKeyboardMarkup([
+                [InlineKeyboardButton("❌ Tutup MediaInfo", callback_data="close_mi")]
+            ])
+            
+            # Simpan caption asli untuk restorasi nanti
+            context.user_data[f"orig_cap_{query.message.message_id}"] = query.message.caption
+            
+            await query.edit_message_caption(
+                caption=f"📊 <b>Detailed Media Information:</b>\n\n<code>{info_str}</code>",
+                reply_markup=markup,
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Error getting mediainfo: {e}")
+            await query.answer("Gagal mengambil Media Info.", show_alert=True)
+
+    async def handle_close_mi(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Restore original caption after closing MediaInfo."""
+        query = update.callback_query
+        await query.answer()
+        
+        orig_cap = context.user_data.get(f"orig_cap_{query.message.message_id}", "Video download selesai.")
+        
+        # Restore original mi button if possible
+        # We don't have the original filename easily here unless we store it
+        # but we can just restore the caption for now.
+        
+        await query.edit_message_caption(
+            caption=orig_cap,
+            parse_mode="HTML"
+        )
+
+    async def _cleanup_user_session(self, user_id, context, reason):
+        """Cleanup user session and temp files."""
+        self.session_manager.force_cleanup_session(user_id)
+        # Additional cleanup if needed
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors and cleanup files & session"""
@@ -2990,7 +3245,9 @@ def main():
         entry_points=[
             # Alur JSON
             MessageHandler(filters.Document.FileExtension("json"), bot.handle_json_file),
-            # Alur /l dan /batch → ikut ConversationHandler agar state subtitle bisa ditangkap
+            # Alur URL JSON
+            MessageHandler(filters.TEXT & filters.Entity("url"), bot.handle_url),
+            # Alur /l dan /batch
             CommandHandler("l",     bot.link_download),
             CommandHandler("batch", bot.batch_download),
         ],
@@ -3029,6 +3286,8 @@ def main():
     app.add_handler(CommandHandler("cancel", bot.cancel))
     app.add_handler(CallbackQueryHandler(bot.handle_settings_choice, pattern="^set_"))
     app.add_handler(CallbackQueryHandler(bot.handle_confirmation_button, pattern="^conf_"))
+    app.add_handler(CallbackQueryHandler(bot.handle_callback_mi, pattern="^mi\|"))
+    app.add_handler(CallbackQueryHandler(bot.handle_close_mi, pattern="^close_mi$"))
     app.add_handler(conv_handler)
     app.add_error_handler(bot.error_handler)
     

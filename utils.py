@@ -5,8 +5,9 @@ import time
 import re
 import shutil
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, List, Union
+from typing import Optional, Dict, Any, Tuple, List, Union, Callable
 import aiofiles
+import aiohttp
 
 from config import (
     SUPPORTED_SOURCES, CLEANUP_DELAY, CLEANUP_ON_ERROR,
@@ -23,6 +24,165 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logging.getLogger("apscheduler").setLevel(logging.WARNING)
 
+# Headers for specific sources
+SOURCE_HEADERS = {
+    "dramaflickreels.com": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": "https://dramaflickreels.com/",
+        "Origin": "https://dramaflickreels.com"
+    }
+}
+
+def get_headers(url: str) -> Dict[str, str]:
+    """Get optimized headers for a specific URL"""
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc.lower()
+    for key, headers in SOURCE_HEADERS.items():
+        if key in domain:
+            return headers.copy()
+    
+    # Default headers
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Referer": url,
+        "Accept": "*/*"
+    }
+
+class JSONParser:
+    """Universal JSON Parser for various drama video sources"""
+    
+    @staticmethod
+    def parse_universal(data: Union[Dict, List, str]) -> Dict[str, Any]:
+        """
+        Recursive search for video info in any JSON structure.
+        Priority given to dramaflickreels format.
+        """
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except:
+                return {}
+
+        result = {
+            "title": "Drama Video",
+            "episodes": [],
+            "cover": None,
+            "description": None,
+            "source": "unknown"
+        }
+
+        # Check for dramaflickreels format
+        if isinstance(data, dict):
+            if "drama" in data and "episodes" in data:
+                drama_info = data["drama"]
+                result["title"] = drama_info.get("title", result["title"])
+                result["cover"] = drama_info.get("cover")
+                result["description"] = drama_info.get("description")
+                result["source"] = drama_info.get("source", "dramaflickreels")
+                
+                for ep in data["episodes"]:
+                    ep_info = {
+                        "id": ep.get("id"),
+                        "name": ep.get("name"),
+                        "index": ep.get("index"),
+                        "video_url": None,
+                        "subtitle_url": None,
+                        "cover": None
+                    }
+                    
+                    # Extract from raw if available
+                    raw = ep.get("raw", {})
+                    if isinstance(raw, dict):
+                        ep_info["video_url"] = raw.get("chapter_link") or raw.get("video_url") or raw.get("m3u8_url")
+                        ep_info["cover"] = raw.get("chapter_cover") or raw.get("cover")
+                    
+                    if not ep_info["video_url"]:
+                        ep_info["video_url"] = ep.get("video_url") or ep.get("url")
+                        
+                    if ep_info["video_url"]:
+                        result["episodes"].append(ep_info)
+                
+                if result["episodes"]:
+                    return result
+
+        # General recursive search fallback
+        all_videos = []
+        all_subs = []
+        
+        def _find_recursively(obj):
+            if isinstance(obj, dict):
+                # Search for video URLs
+                for k, v in obj.items():
+                    if isinstance(v, str) and any(ext in v.lower() for ext in ['.m3u8', '.mp4', '.m4v']):
+                        if v not in all_videos:
+                            all_videos.append(v)
+                    elif isinstance(v, (dict, list)):
+                        _find_recursively(v)
+                
+                # Search for titles/covers
+                if not result["cover"]:
+                    result["cover"] = obj.get("cover") or obj.get("image") or obj.get("poster")
+                if result["title"] == "Drama Video":
+                    result["title"] = obj.get("title") or obj.get("drama_name") or obj.get("name", result["title"])
+
+            elif isinstance(obj, list):
+                for item in obj:
+                    _find_recursively(item)
+
+        _find_recursively(data)
+        
+        if all_videos and not result["episodes"]:
+            for i, vid in enumerate(all_videos):
+                result["episodes"].append({
+                    "name": f"Episode {i+1}",
+                    "index": i,
+                    "video_url": vid
+                })
+        
+        return result
+
+    @staticmethod
+    def extract_subtitle_id(data: Any) -> Optional[str]:
+        """Detect Indonesian subtitle from varying structures"""
+        # Multi-layer search for Indonesian language codes
+        indonesian_codes = ["id", "ind", "indo", "bahasa", "indonesian"]
+        
+        def _check_lang(val):
+            if not isinstance(val, str): return False
+            val = val.lower()
+            return any(code in val for code in indonesian_codes)
+
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    lang = item.get("language") or item.get("lang") or item.get("name")
+                    if _check_lang(lang):
+                        return item.get("url") or item.get("link") or item.get("src")
+        
+        return None
+
+    @staticmethod
+    def get_progress_bar(percentage: float, length: int = 20) -> str:
+        """Generate a stylized progress bar: ████████░░░░ 65%"""
+        percentage = max(0, min(100, percentage))
+        filled = int(length * percentage / 100)
+        bar = "█" * filled + "░" * (length - filled)
+        return f"{bar} {percentage:.1f}%"
+
+    @staticmethod
+    def format_size(bytes_size: int) -> str:
+        """Format bytes to human readable form"""
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes_size < 1024:
+                return f"{bytes_size:.2f} {unit}"
+            bytes_size /= 1024
+        return f"{bytes_size:.2f} TB"
+
+    @staticmethod
+    def format_speed(bytes_per_sec: float) -> str:
+        """Format speed to human readable form"""
+        return f"{JSONParser.format_size(int(bytes_per_sec))}/s"
+
 # Daftar semua variasi kode subtitle Indonesia
 INDONESIAN_SUBTITLE_CODES = [
     # Language codes
@@ -37,7 +197,7 @@ INDONESIAN_SUBTITLE_CODES = [
     "23", "102", "105",
     # Other variations
     "indonesian (id)", "id (indonesian)", "id-id (indonesian)",
-    "id-ID (Indonesian)", "bahasa (id)", "indo", "indon"
+    "id-ID (Indonesian)", "bahasa (id)", "indo", "indon", "id_ID"
 ]
 
 class FileCleanup:
@@ -226,6 +386,23 @@ class SubtitleDetector:
         
         return None
 
+    @staticmethod
+    def get_progress_bar(percentage: float, length: int = 15) -> str:
+        """
+        Generate stylized progress bar: ████████░░░░ 65%
+        """
+        filled = int(length * percentage / 100)
+        bar = "█" * filled + "░" * (length - filled)
+        return f"{bar} {percentage:.1f}%"
+
+    @staticmethod
+    def format_speed(bps: float) -> str:
+        """Format speed to human readable string"""
+        if bps < 1024: return f"{bps:.0f} B/s"
+        elif bps < 1024**2: return f"{bps/1024:.1f} KB/s"
+        elif bps < 1024**3: return f"{bps/1024**2:.1f} MB/s"
+        else: return f"{bps/1024**3:.1f} GB/s"
+
 
 class JSONParser:
     """Parse various JSON formats from different sources"""
@@ -279,9 +456,74 @@ class JSONParser:
             return JSONParser._parse_flikreels(data)
         elif "episode_list" in data:  # freereels format
             return JSONParser._parse_freereels(data)
+        elif "drama" in data and "episodes" in data:  # dramaflickreels format
+            return JSONParser._parse_dramaflickreels(data)
         
         # Generic fallback - try common patterns
         return JSONParser._parse_generic(data)
+
+    @staticmethod
+    def universal_parse(data: Any) -> Dict[str, Any]:
+        """
+        Recursively search for video and subtitle URLs in any JSON structure.
+        Returns combined data expected by bot.py
+        """
+        v_patterns = [
+            r'\.m3u8(?:\?|$)', r'\.mp4(?:\?|$)', r'/hls/playlist\.m3u8',
+            r'/bitly-stream/', r'stream_url', r'stream-url', r'm3u8-url'
+        ]
+        s_patterns = [r'\.vtt(?:\?|$)', r'\.srt(?:\?|$)', r'subtitle_url', r'sub_url']
+        
+        found_videos = []
+        found_subtitles = []
+        
+        def _walk(obj):
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    k_lower = str(k).lower()
+                    if isinstance(v, str) and v.startswith('http'):
+                        is_v = any(re.search(p, v, re.I) for p in v_patterns) or \
+                               any(sub in k_lower for sub in ['stream', 'm3u8', 'mp4', 'play_url', 'direct_link', 'video_url', 'sources'])
+                        if is_v:
+                            if v not in found_videos: found_videos.append(v)
+                        
+                        is_s = any(re.search(p, v, re.I) for p in s_patterns) or \
+                               any(sub in k_lower for sub in ['subtitle', 'sub_url', 'zimu', 'sublist'])
+                        if is_s:
+                            if v not in found_subtitles: found_subtitles.append(v)
+                    _walk(v)
+            elif isinstance(obj, list):
+                for item in obj:
+                    _walk(item)
+                    
+        _walk(data)
+        
+        # Ekstrak semua episode terstruktur jika ada
+        all_episodes = JSONParser.extract_all_episodes(data)
+        
+        # Tentukan default URL
+        video_url = None
+        if all_episodes:
+            video_url = all_episodes[0].get("url")
+        elif found_videos:
+            video_url = found_videos[0]
+            
+        subtitle_url = None
+        if all_episodes:
+            subtitle_url = next((ep.get("subtitle_url") for ep in all_episodes if ep.get("subtitle_url")), None)
+        elif found_subtitles:
+            subtitle_url = found_subtitles[0]
+            
+        # Gabungkan hasil
+        return {
+            'videos': found_videos,
+            'subtitles': found_subtitles,
+            'all_episodes': all_episodes,
+            'url': video_url,
+            'subtitle_url': subtitle_url,
+            'title': all_episodes[0].get("drama_title", "Video") if all_episodes else "Video",
+            'cover_url': all_episodes[0].get("cover_url") if all_episodes else None
+        }
     
     @staticmethod
     def extract_all_episodes(data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -566,6 +808,27 @@ class JSONParser:
                             "title": item.get("name", f"Episode {episode_num}"),
                             "url": video_url,
                             "subtitle_url": subtitle_url
+                        })
+            
+            # Dramaflickreels format
+            elif "drama" in data and "episodes" in data:
+                drama_info = data.get("drama", {})
+                drama_name = drama_info.get("title", "Drama")
+                ep_list = data.get("episodes", [])
+                logger.info(f"Detected dramaflickreels format with {len(ep_list)} episodes")
+                for ep_item in ep_list:
+                    raw_data = ep_item.get("raw", {})
+                    ep_num = str(raw_data.get("chapter_num", ep_item.get("index", 1)))
+                    v_url = raw_data.get("videoUrl") or ep_item.get("url")
+                    if v_url:
+                        episodes.append({
+                            "episode": ep_num,
+                            "title": ep_item.get("name", f"Episode {ep_num}"),
+                            "drama_title": drama_name,
+                            "url": v_url,
+                            "subtitle_url": None,
+                            "has_subtitle": False,
+                            "cover_url": drama_info.get("cover") or raw_data.get("chapter_cover")
                         })
             
             # Sort episodes by episode number
@@ -904,6 +1167,20 @@ class JSONParser:
                     return video_url, subtitle_url
         except Exception as e:
             logger.error(f"Error parsing velolo: {e}")
+        return None, None
+
+    @staticmethod
+    def _parse_dramaflickreels(data: Dict) -> Tuple[Optional[str], Optional[str]]:
+        """Parse dramaflickreels JSON format"""
+        try:
+            episodes = data.get("episodes", [])
+            if episodes:
+                first = episodes[0]
+                video_url = first.get("raw", {}).get("videoUrl") or first.get("url")
+                if video_url:
+                    return video_url, None
+        except Exception as e:
+            logger.error(f"Error parsing dramaflickreels: {e}")
         return None, None
 
     @staticmethod

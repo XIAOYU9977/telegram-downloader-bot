@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 # Bot Configuration
-BOT_TOKEN = "8388093985:AAG1BrNL_bLsPIhab4uSqZheYofii62Ut5M"
+BOT_TOKEN = "8362327565:AAGrWixmH4ktkBVqk9ewGF-3oHViLZ2r8x8"
 ALLOWED_USERS = []  # Kosong = semua user diizinkan
 
 # Pyrogram Configuration (MTProto Upload Cepat)
@@ -111,9 +111,9 @@ CLEANUP_ON_ERROR = True
 # ============================================================
 # SESSION & CONCURRENCY
 # ============================================================
-SESSION_TIMEOUT          = 600
-MAX_CONCURRENT_DOWNLOADS = 2  # Fokus untuk kecepatan 1-2 user
-MAX_CONCURRENT_UPLOADS   = 2  # Menghindari bandwidth terbagi habis
+SESSION_TIMEOUT          = 3600 # 1 Hour
+MAX_CONCURRENT_DOWNLOADS = 2  # Limits to 2 simultaneous users downloading
+MAX_CONCURRENT_UPLOADS   = 2  
 MAX_RETRIES              = 3
 RETRY_DELAY              = 5
 
