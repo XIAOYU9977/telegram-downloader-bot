@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Optional, Callable, List, Dict
 from urllib.parse import urlparse
 
-from utils import logger, get_headers
+from utils import logger, get_headers, SubtitleDetector
 from config import CLEANUP_ON_ERROR, DOWNLOAD_PROXY
 from hls_downloader import OptimizedHLSDownloader, HLSStreamInfo
 
@@ -347,11 +347,13 @@ class DownloadManager:
                         break
     
     async def detect_hls_subtitles(self, url: str) -> List[Dict]:
-        """Deteksi subtitle dari HLS stream"""
+        """Deteksi subtitle dari HLS stream dengan prioritization Indonesian"""
         try:
             if self._is_hls(url):
                 stream_info = await self.hls_downloader.analyze_stream(url)
                 if stream_info:
+                    # Return all tracks but mark/prioritize Indonesian if needed
+                    # Note: analyze_stream already uses SubtitleDetector to mark tracks
                     return stream_info.subtitle_tracks
         except Exception as e:
             logger.warning(f"Subtitle detection failed: {e}")

@@ -207,18 +207,23 @@ class JSONParser:
 # Daftar semua variasi kode subtitle Indonesia
 INDONESIAN_SUBTITLE_CODES = [
     # Language codes
-    "id", "id-ID", "id-id", "id_id", "ind", "in", "ID", "ID-ID",
+    "id", "id-ID", "id-id", "id_id", "ind", "in", "ID", "ID-ID", "in-ID", "in_ID",
     # Full names
     "indonesia", "indonesian", "bahasa", "bahasa_indonesia", "bahasa indonesia",
-    "indonesian subtitle", "sub indo", "subtitle indonesia",
-    # Common field names
+    "indonesian subtitle", "sub indo", "subtitle indonesia", "indo sub",
+    # Common field names (prefixed/suffixed)
     "sub_id", "sub_ind", "subtitle_id", "subtitle_ind", "subtitle_indo",
-    "sub_idn", "subtitle_idn", "sub_bahasa", "subtitles_id",
+    "sub_idn", "subtitle_idn", "sub_bahasa", "subtitles_id", "sub-id", "sub-ind",
     # Numeric codes (common in some APIs)
     "23", "102", "105",
     # Other variations
     "indonesian (id)", "id (indonesian)", "id-id (indonesian)",
     "id-ID (Indonesian)", "bahasa (id)", "indo", "indon", "id_ID"
+]
+
+# Keywords for official/premium subtitles
+OFFICIAL_SUB_KEYWORDS = [
+    "official", "resmi", "production", "original", "premium", "pro", "studio", "master"
 ]
 
 class FileCleanup:
@@ -350,7 +355,7 @@ class FileCleanup:
 
 
 class SubtitleDetector:
-    """Helper class to detect Indonesian subtitles in various formats"""
+    """Helper class to detect Indonesian subtitles with prioritization"""
     
     @staticmethod
     def is_indonesian_subtitle(subtitle_data: Dict[str, Any]) -> bool:
@@ -358,34 +363,67 @@ class SubtitleDetector:
         language_fields = [
             "language", "lang", "language_code", "lang_code", 
             "code", "languageId", "lang_id", "sub_lang", "subtitle_lang",
-            "locale", "language_name", "name", "display_name", "title"
+            "locale", "language_name", "name", "display_name", "title", "label"
         ]
         
         for field in language_fields:
-            if field in subtitle_data:
+            if field in subtitle_data and subtitle_data[field]:
                 value = str(subtitle_data[field]).lower().strip()
+                # Check for exact matches and inclusion
                 for code in INDONESIAN_SUBTITLE_CODES:
-                    if code.lower() in value or value in code.lower():
-                        logger.info(f"Found Indonesian subtitle with {field}={value}")
+                    code_lower = code.lower()
+                    if value == code_lower or f"({code_lower})" in value or f" {code_lower}" in value:
+                        logger.info(f"[SUB-DETECTION] Match found: {field}='{value}' corresponds to Indonesian ({code})")
                         return True
         
-        type_fields = ["type", "subtitle_type", "origin", "source", "category"]
-        for field in type_fields:
-            if field in subtitle_data:
-                value = str(subtitle_data[field]).lower().strip()
-                if "original" in value or "indonesian" in value or "bahasa" in value:
-                    logger.info(f"Found Indonesian subtitle with {field}={value}")
-                    return True
+        # Additional check in URI/URL if no field matches
+        url = SubtitleDetector.get_subtitle_url(subtitle_data)
+        if url:
+            url_lower = url.lower()
+            if any(f"_{c}." in url_lower or f"-{c}." in url_lower or f"/{c}/" in url_lower for c in ["id", "ind", "indo"]):
+                logger.info(f"[SUB-DETECTION] Match found in URL: Indonesian pattern detected in {url}")
+                return True
         
         return False
     
     @staticmethod
+    def is_official_subtitle(subtitle_data: Dict[str, Any]) -> bool:
+        """Heuristic check for official/authoritative subtitle sources"""
+        search_fields = ["name", "label", "title", "type", "category", "source", "author"]
+        for field in search_fields:
+            if field in subtitle_data and subtitle_data[field]:
+                value = str(subtitle_data[field]).lower()
+                if any(kw in value for kw in OFFICIAL_SUB_KEYWORDS):
+                    logger.info(f"[SUB-DETECTION] Priority found: Subtitle identified as OFFICIAL via {field}='{value}'")
+                    return True
+        return False
+
+    @staticmethod
     def find_indonesian_subtitle(subtitle_list: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        """Find Indonesian subtitle in a list of subtitles"""
-        for subtitle in subtitle_list:
-            if SubtitleDetector.is_indonesian_subtitle(subtitle):
-                return subtitle
-        return None
+        """
+        Find the BEST Indonesian subtitle in a list.
+        Priority: 1. Official Indonesian, 2. Any Indonesian
+        """
+        if not subtitle_list:
+            return None
+            
+        indonesian_subs = [s for s in subtitle_list if SubtitleDetector.is_indonesian_subtitle(s)]
+        
+        if not indonesian_subs:
+            return None
+            
+        if len(indonesian_subs) == 1:
+            return indonesian_subs[0]
+            
+        # Try to find official one among Indonesian subs
+        for sub in indonesian_subs:
+            if SubtitleDetector.is_official_subtitle(sub):
+                logger.info(f"[SUB-DETECTION] Multiple subs found, selecting official Indonesian subtitle.")
+                return sub
+                
+        # Default to the first one found if no "official" tag
+        logger.info(f"[SUB-DETECTION] Multiple subs found, selecting first available Indonesian subtitle.")
+        return indonesian_subs[0]
     
     @staticmethod
     def get_subtitle_url(subtitle_data: Dict[str, Any]) -> Optional[str]:
@@ -393,16 +431,13 @@ class SubtitleDetector:
         url_fields = [
             "url", "subtitle", "subtitle_url", "file", "path", "src",
             "link", "download_url", "sub", "sub_file", "subtitle_file",
-            "sub_link", "subtitle_link", "srt", "vtt", "subtitle_path"
+            "sub_link", "subtitle_link", "srt", "vtt", "subtitle_path", "uri"
         ]
         
         for field in url_fields:
             if field in subtitle_data and subtitle_data[field]:
                 url = subtitle_data[field]
-                if isinstance(url, str) and url.startswith(('http://', 'https://')):
-                    return url
-                elif isinstance(url, str) and url:
-                    logger.warning(f"Found relative subtitle URL: {url}")
+                if isinstance(url, str) and (url.startswith(('http://', 'https://')) or url.endswith(('.vtt', '.srt', '.ass'))):
                     return url
         
         return None

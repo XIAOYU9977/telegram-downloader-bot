@@ -161,7 +161,7 @@ class VideoProcessor:
         Embed subtitle sebagai soft subtitle track.
         """
         try:
-            logger.info(f"💬 Embedding softsub: {subtitle_path.name} → {video_path.name}")
+            logger.info(f"[SUB-PROCESS] Embedding softsub: {subtitle_path.name} → {video_path.name}")
 
             if not video_path.exists():
                 logger.error(f"❌ Video not found: {video_path}")
@@ -176,7 +176,7 @@ class VideoProcessor:
                 if converted:
                     srt_path = converted
 
-            logger.info(f"💬 SRT ready: {srt_path.name}")
+            logger.info(f"[SUB-PROCESS] Subtitle preparation: SRT ready at {srt_path.name}")
 
             # ── PRE-CHECK: Log existing streams ────────────────────────────
             try:
@@ -191,7 +191,7 @@ class VideoProcessor:
                 )
                 stdout, _ = await probe_proc.communicate()
                 streams_info = stdout.decode().strip().replace('\n', ' | ')
-                logger.info(f"🔍 Input streams: {streams_info}")
+                logger.info(f"[SUB-PROCESS] Pre-check Input streams: {streams_info}")
             except Exception as probe_err:
                 logger.warning(f"⚠️ Pre-check ffprobe failed: {probe_err}")
 
@@ -215,6 +215,7 @@ class VideoProcessor:
             ]
             result = await self._run_ffmpeg(cmd_mp4, None, output_path, user_id)
             if result:
+                logger.info(f"[SUB-PROCESS] Standard MP4 softsub embedding successful.")
                 return result
 
             # ── STEP 2: MKV Fallback (SRT native) ──────────────────────────
@@ -235,6 +236,7 @@ class VideoProcessor:
             ]
             result = await self._run_ffmpeg(cmd_mkv, None, mkv_output, user_id)
             if result:
+                logger.info(f"[SUB-PROCESS] MKV fallback softsub embedding successful.")
                 return result
 
             # ── STEP 3: FAILSAFES ──────────────────────────────────────────
@@ -260,7 +262,7 @@ class VideoProcessor:
                             subtitle_lang: str = "id") -> Optional[Path]:
         """Burn subtitle ke video dengan fallback methods"""
         try:
-            logger.info(f"🔥 Burning subtitle: {subtitle_path} into {video_path}")
+            logger.info(f"[SUB-PROCESS] Burning subtitle: {subtitle_path.name} into {video_path.name} (Lang: {subtitle_lang})")
 
             if not video_path.exists():
                 logger.error(f"❌ Video not found: {video_path}")
@@ -276,7 +278,7 @@ class VideoProcessor:
             # Prepare subtitle (encoding fix + format convert)
             converted_sub = await self.prepare_subtitle(subtitle_path)
             if converted_sub != subtitle_path:
-                logger.info(f"✅ Using converted subtitle: {converted_sub}")
+                logger.info(f"[SUB-PROCESS] Subtitle converted/prepared: {converted_sub.name}")
                 subtitle_path = converted_sub
 
             await self.verify_subtitle(subtitle_path)
@@ -292,7 +294,7 @@ class VideoProcessor:
                 logger.info(f"🎬 Trying {method_name}...")
                 result = await method_func(video_path, subtitle_path, output_path, user_id, progress_callback)
                 if result and result.exists() and result.stat().st_size > 0:
-                    logger.info(f"✅ {method_name} succeeded! {result.stat().st_size} bytes")
+                    logger.info(f"[SUB-PROCESS] {method_name} successful! Result: {result.name} ({result.stat().st_size} bytes)")
                     return result
                 logger.warning(f"⚠️ {method_name} failed")
 

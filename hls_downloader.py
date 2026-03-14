@@ -13,7 +13,7 @@ from datetime import datetime
 import aiohttp
 import aiofiles
 
-from utils import logger, FileCleanup, format_size
+from utils import logger, FileCleanup, format_size, SubtitleDetector
 from config import (
     DOWNLOAD_TIMEOUT, PROCESSING_TIMEOUT, MAX_SEGMENT_RETRIES,
     SEGMENT_CONCURRENCY, TARGET_FILE_SIZE_MB, TARGET_VIDEO_BITRATE,
@@ -336,7 +336,13 @@ class OptimizedHLSDownloader:
                 
                 if uri:
                     subtitle_url = urljoin(base_url, uri)
-                    is_indonesian = any(code in language.lower() for code in ['id', 'ind', 'ina', 'indonesian', 'bahasa'])
+                    # Use enhanced SubtitleDetector for consistent identification
+                    is_indonesian = SubtitleDetector.is_indonesian_subtitle({
+                        "name": name, 
+                        "language": language, 
+                        "uri": uri,
+                        "label": name
+                    })
                     
                     subtitle_tracks.append({
                         "url": subtitle_url,
@@ -347,7 +353,10 @@ class OptimizedHLSDownloader:
                         "is_indonesian": is_indonesian,
                         "uri": uri
                     })
-                    logger.info(f"📝 Found subtitle track: {name} ({language}) - Indonesian: {is_indonesian}")
+                    if is_indonesian:
+                        logger.info(f"[SUB-DETECTION] HLS Subtitle Track found: {name} ({language}) -> INDONESIAN")
+                    else:
+                        logger.info(f"📝 Found subtitle track: {name} ({language})")
             
             i += 1
         
@@ -405,19 +414,20 @@ class OptimizedHLSDownloader:
                     stream_info.selected_audio = default_audio
                     logger.info(f"🔊 Selected audio: {default_audio['name']} ({default_audio['language']})")
             
-            # Pilih subtitle (prioritas Indonesian)
+            # Pilih subtitle (prioritas Indonesian via SubtitleDetector)
             if best_variant["subtitle_group"] and subtitle_tracks:
                 matching_subs = [s for s in subtitle_tracks if s["group_id"] == best_variant["subtitle_group"]]
                 if matching_subs:
-                    # Cari subtitle Indonesia
-                    indo_sub = next((s for s in matching_subs if s["is_indonesian"]), None)
-                    if indo_sub:
-                        stream_info.selected_subtitle = indo_sub
-                        logger.info(f"📝 Selected Indonesian subtitle: {indo_sub['name']}")
+                    # Use centralized best-match logic
+                    best_sub = SubtitleDetector.find_indonesian_subtitle(matching_subs)
+                    if best_sub:
+                        stream_info.selected_subtitle = best_sub
+                        logger.info(f"[SUB-DETECTION] Selected best Indonesian subtitle: {best_sub['name']}")
                     else:
-                        # Ambil default atau pertama
+                        # Fallback: Ambil default atau pertama
                         default_sub = next((s for s in matching_subs if s["default"]), matching_subs[0])
                         stream_info.selected_subtitle = default_sub
+                        logger.info(f"📝 Selected default/fallback subtitle: {default_sub['name']}")
             
             # Fetch media playlist untuk video
             media_content = await self._fetch_with_retry(best_variant["url"])
@@ -488,14 +498,16 @@ class OptimizedHLSDownloader:
             uri = urljoin(base_url, match.group(1))
             lang = match.group(2)
             
-            # Deteksi subtitle Indonesia
-            is_indonesian = any(code in lang.lower() for code in ['id', 'ind', 'ina', 'indonesian', 'bahasa'])
+            # Deteksi subtitle Indonesia using detector
+            is_indonesian = SubtitleDetector.is_indonesian_subtitle({"language": lang, "uri": uri})
             
             tracks.append({
                 "url": uri,
                 "language": lang,
                 "is_indonesian": is_indonesian
             })
+            if is_indonesian:
+                logger.info(f"[SUB-DETECTION] Parsed subtitle track: {lang} -> INDONESIAN")
         
         return tracks
 

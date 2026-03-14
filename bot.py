@@ -1020,11 +1020,22 @@ class DownloaderBot:
 
             eps_with_sub = sum(1 for ep in all_episodes if ep.get('subtitle_url'))
             
-            # Tanya mode subtitle jika ada subtitle Indonesia
+            # [SUB-PRIORITY] Auto-select 'embed' (Hardsub) or 'softsub' if Indonesian subs found
             if eps_with_sub > 0:
+                # Default to hardsub as requested ("menggabungkan subtitle")
+                # But allow user to change if they want. 
+                # To follow USER REQUEST strictly: "selalu mendeteksi, mendownload, dan menggabungkan"
+                default_mode = "embed" 
+                for ep in all_episodes:
+                    if ep.get("subtitle_url"):
+                        ep["subtitle_mode"] = default_mode
+                
+                logger.info(f"[SUB-PRIORITY] Indonesian subtitles found for {eps_with_sub} episodes. Auto-setting mode to {default_mode}.")
+                
                 await update.message.reply_text(
-                    f"📝 <b>Subtitle Indonesia terdeteksi</b> ({eps_with_sub} episode)\n\n"
-                    "Pilih cara memproses subtitle:\n\n"
+                    f"📝 <b>Subtitle Indonesia terdeteksi</b> ({eps_with_sub} episode)\n"
+                    f"Otomatis memilih mode: <b>Hardsub (Gabung ke Video)</b>\n\n"
+                    "Pilih cara lain jika ingin mengubah:\n\n"
                     "  <b>1</b> → 💬 Softsub (embedded track, bisa dimatikan)\n"
                     "  <b>2</b> → 🔥 Hardsub (subtitle dibakar ke video)\n"
                     "  <b>3</b> → 📄 Subtitle terpisah (.srt dikirim sendiri)\n"
@@ -1621,16 +1632,23 @@ class DownloaderBot:
         try:
             # Gunakan download manager untuk deteksi subtitle
             raw_tracks = await self.download_manager.detect_hls_subtitles(raw_url)
-            subtitle_tracks = [
-                t for t in raw_tracks
-                if not self._is_hls_url(t.get("uri", ""))
-                and any(ext in t.get("uri", "").lower()
-                        for ext in (".vtt", ".srt", ".ass", "subtitle", "sub"))
-            ]
-            if raw_tracks and not subtitle_tracks:
-                logger.info(f"[/l] {len(raw_tracks)} track ditemukan tapi semua M3U8, diabaikan.")
-            if subtitle_tracks:
-                sub_url = subtitle_tracks[0].get("uri", "")
+            if raw_tracks:
+                # Use detector to find BEST Indonesian track
+                best_indo = SubtitleDetector.find_indonesian_subtitle(raw_tracks)
+                if best_indo:
+                    sub_url = SubtitleDetector.get_subtitle_url(best_indo)
+                    subtitle_tracks = [best_indo]
+                    logger.info(f"[SUB-PRIORITY] Indonesian subtitle found and prioritized: {best_indo.get('name')}")
+                else:
+                    # Fallback to current filtering logic if no prioritized Indonesian found
+                    subtitle_tracks = [
+                        t for t in raw_tracks
+                        if not self._is_hls_url(t.get("uri", ""))
+                        and any(ext in t.get("uri", "").lower()
+                                for ext in (".vtt", ".srt", ".ass", "subtitle", "sub"))
+                    ]
+                    if subtitle_tracks:
+                        sub_url = subtitle_tracks[0].get("uri", "")
         except Exception as e:
             logger.warning(f"[/l] Gagal deteksi subtitle: {e}")
 
@@ -1645,17 +1663,35 @@ class DownloaderBot:
                 "output_path": str(output_path),
                 "status_msg":  detect_msg,
             }
-            await detect_msg.edit_text(
-                f"📥 <b>Download dimulai</b>\n"
-                f"🎬 <b>Judul:</b> {user_title}\n"
-                f"🔗 <b>Sumber:</b> {source_label}\n\n"
-                f"💬 <b>Subtitle terdeteksi</b> untuk video ini.\n"
-                f"Apakah subtitle ingin digabungkan?\n\n"
-                f"1️⃣ Gabungkan subtitle ke video\n"
-                f"2️⃣ Kirim video tanpa subtitle\n"
-                f"3️⃣ Kirim subtitle sebagai file terpisah",
-                parse_mode="HTML"
-            )
+            # [SUB-PRIORITY] Automate choice if Indonesian detected
+            is_indonesia = any(SubtitleDetector.is_indonesian_subtitle(t) for t in subtitle_tracks)
+            if is_indonesia:
+                context.user_data["pending_single"]["subtitle_mode"] = "embed"
+                logger.info(f"[SUB-PRIORITY] Indonesian sub detected for /l, auto-selecting 'embed' mode.")
+                
+                await detect_msg.edit_text(
+                    f"📥 <b>Download dimulai</b>\n"
+                    f"🎬 <b>Judul:</b> {user_title}\n"
+                    f"🔗 <b>Sumber:</b> {source_label}\n\n"
+                    f"💬 <b>Subtitle Indonesia terdeteksi</b>\n"
+                    f"Otomatis memilih: <b>Hardsub (Gabung ke Video)</b>\n\n"
+                    f"1️⃣ Gabungkan subtitle ke video\n"
+                    f"2️⃣ Kirim video tanpa subtitle\n"
+                    f"3️⃣ Kirim subtitle sebagai file terpisah",
+                    parse_mode="HTML"
+                )
+            else:
+                await detect_msg.edit_text(
+                    f"📥 <b>Download dimulai</b>\n"
+                    f"🎬 <b>Judul:</b> {user_title}\n"
+                    f"🔗 <b>Sumber:</b> {source_label}\n\n"
+                    f"💬 <b>Subtitle terdeteksi</b> untuk video ini.\n"
+                    f"Apakah subtitle ingin digabungkan?\n\n"
+                    f"1️⃣ Gabungkan subtitle ke video\n"
+                    f"2️⃣ Kirim video tanpa subtitle\n"
+                    f"3️⃣ Kirim subtitle sebagai file terpisah",
+                    parse_mode="HTML"
+                )
             return AWAITING_SUBTITLE_CHOICE
 
         else:
@@ -1826,39 +1862,66 @@ class DownloaderBot:
 
         # ── Pre-scan subtitle (sample 3 link pertama) ─────────────────────────
         has_any_subtitle = False
+        is_indonesian_detected = False
         try:
             for sample_url in urls[:3]:
                 raw_tracks = await self.download_manager.detect_hls_subtitles(sample_url)
-                real_tracks = [
-                    t for t in raw_tracks
-                    if not self._is_hls_url(t.get("uri", ""))
-                    and any(ext in t.get("uri", "").lower()
-                            for ext in (".vtt", ".srt", ".ass", "subtitle", "sub"))
-                ]
-                if real_tracks:
-                    has_any_subtitle = True
-                    break
+                if raw_tracks:
+                    # Check for Indonesian specifically
+                    if SubtitleDetector.find_indonesian_subtitle(raw_tracks):
+                        is_indonesian_detected = True
+                        has_any_subtitle = True
+                        logger.info(f"[SUB-PRIORITY] Indonesian subtitle detected in batch pre-scan: {sample_url}")
+                        break
+                    
+                    real_tracks = [
+                        t for t in raw_tracks
+                        if not self._is_hls_url(t.get("uri", ""))
+                        and any(ext in t.get("uri", "").lower()
+                                for ext in (".vtt", ".srt", ".ass", "subtitle", "sub"))
+                    ]
+                    if real_tracks:
+                        has_any_subtitle = True
+                        # Don't break yet, keep looking for Indonesian in other samples
         except Exception as e:
             logger.warning(f"[/batch] Pre-scan subtitle gagal: {e}")
 
         if has_any_subtitle:
-            # ── Ada subtitle → tanya user sekali ─────────────────────────
+            # ── Ada subtitle → simpan pending, tanya user sekali ─────────────────────────
             context.user_data["pending_batch"] = {
                 "urls":         urls,
                 "series_title": series_title,
                 "status_msg":   status_msg,
             }
-            await status_msg.edit_text(
-                f"📥 <b>Batch download dimulai</b>\n"
-                f"🎬 <b>Series:</b> {series_title}\n"
-                f"📦 <b>Total Episode:</b> {total}\n\n"
-                f"💬 <b>Subtitle terdeteksi</b> pada beberapa episode.\n"
-                f"Bagaimana subtitle ingin diproses?\n\n"
-                f"1️⃣ Gabungkan semua subtitle ke video\n"
-                f"2️⃣ Tanpa subtitle\n"
-                f"3️⃣ Kirim subtitle terpisah",
-                parse_mode="HTML"
-            )
+            
+            if is_indonesian_detected:
+                # Default to hardsub for Indonesian
+                context.user_data["pending_batch"]["subtitle_mode"] = "embed"
+                logger.info(f"[SUB-PRIORITY] Indonesian sub detected for /batch, auto-selecting 'embed' mode.")
+                
+                await status_msg.edit_text(
+                    f"📥 <b>Batch download dimulai</b>\n"
+                    f"🎬 <b>Series:</b> {series_title}\n"
+                    f"📦 <b>Total Episode:</b> {total}\n\n"
+                    f"💬 <b>Subtitle Indonesia terdeteksi</b> pada beberapa episode.\n"
+                    f"Otomatis memilih: <b>Hardsub (Gabung ke Video)</b>\n\n"
+                    f"1️⃣ Gabungkan semua subtitle ke video\n"
+                    f"2️⃣ Tanpa subtitle\n"
+                    f"3️⃣ Kirim subtitle terpisah",
+                    parse_mode="HTML"
+                )
+            else:
+                await status_msg.edit_text(
+                    f"📥 <b>Batch download dimulai</b>\n"
+                    f"🎬 <b>Series:</b> {series_title}\n"
+                    f"📦 <b>Total Episode:</b> {total}\n\n"
+                    f"💬 <b>Subtitle terdeteksi</b> pada beberapa episode.\n"
+                    f"Bagaimana subtitle ingin diproses?\n\n"
+                    f"1️⃣ Gabungkan semua subtitle ke video\n"
+                    f"2️⃣ Tanpa subtitle\n"
+                    f"3️⃣ Kirim subtitle terpisah",
+                    parse_mode="HTML"
+                )
             return AWAITING_BATCH_SUBTITLE
 
         else:
@@ -2238,21 +2301,25 @@ class DownloaderBot:
 
                     successful += 1
 
-                    # ── Kirim subtitle terpisah jika mode separate ────
-                    if ep_subtitle_mode == "separate" and subtitle_file and subtitle_file.exists():
+                    # ── [DUAL-DELIVERY] Kirim subtitle terpisah JIKA Indonesian tersedia ────
+                    # User request: "simpan juga subtitle terpisah selain yang digabung"
+                    if subtitle_file and subtitle_file.exists():
                         try:
-                            safe_sub_name = f"{safe_title}_{safe_episode}.id.srt"
-                            with open(subtitle_file, 'rb') as sub_f:
-                                await context.bot.send_document(
-                                    chat_id=user_id,
-                                    document=sub_f,
-                                    filename=safe_sub_name,
-                                    caption=f"📝 <b>Subtitle Indonesia</b> — {drama_title} Ep {episode_num}",
-                                    parse_mode="HTML"
-                                )
-                            logger.info(f"[sub-separate] Subtitle terkirim: {safe_sub_name}")
+                            # Selalu kirim track Indonesia jika ada, apapun mode-nya (kecuali 'none')
+                            if ep_subtitle_mode != "none":
+                                logger.info(f"[DUAL-DELIVERY] Sending separate subtitle backup for Ep {episode_num}")
+                                safe_sub_name = f"{safe_title}_{safe_episode}.id.srt"
+                                with open(subtitle_file, 'rb') as sub_f:
+                                    await context.bot.send_document(
+                                        chat_id=user_id,
+                                        document=sub_f,
+                                        filename=safe_sub_name,
+                                        caption=f"📝 <b>Subtitle Indonesia (Backup)</b> — {drama_title} Ep {episode_num}",
+                                        parse_mode="HTML"
+                                    )
+                                logger.info(f"[DUAL-DELIVERY] Subtitle backup sent: {safe_sub_name}")
                         except Exception as sub_err:
-                            logger.warning(f"[sub-separate] Gagal kirim subtitle: {sub_err}")
+                            logger.warning(f"[DUAL-DELIVERY] Gagal kirim subtitle backup: {sub_err}")
 
                 except Exception as e:
                     logger.error(f"Upload failed for episode {episode_num}: {e}")
