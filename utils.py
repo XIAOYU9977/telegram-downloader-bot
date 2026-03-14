@@ -29,6 +29,11 @@ try:
 except ImportError:
     ViglooParser = None
 
+try:
+    from flickreels.parser import FlickReelsParser
+except ImportError:
+    FlickReelsParser = None
+
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
@@ -601,7 +606,8 @@ class JSONParser:
             'url': video_url,
             'subtitle_url': subtitle_url,
             'title': all_episodes[0].get("drama_title", "Video") if all_episodes else "Video",
-            'cover_url': all_episodes[0].get("cover_url") if all_episodes else None
+            'cover_url': all_episodes[0].get("cover_url") if all_episodes else None,
+            'source': all_episodes[0].get("source", "unknown") if all_episodes else "unknown"
         }
     
     @staticmethod
@@ -629,11 +635,75 @@ class JSONParser:
                             "title": drama_title,
                             "url": video_url,
                             "subtitle_url": subtitle_url,
-                            "has_subtitle": bool(subtitle_url)
+                            "has_subtitle": bool(subtitle_url),
+                            "source": "velolo"
                         })
-                # Sort dan return langsung agar tidak masuk blok lain
                 episodes.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
                 return episodes
+
+            # ── Shortmax format ───────────────────────────────────────────────
+            if ("shortPlayId" in data or "shortPlayName" in data or "episodes" in data) and ShortmaxParser:
+                try:
+                    parsed = ShortmaxParser.parse(data)
+                    if parsed.get("episodes"):
+                        logger.info(f"Detected shortmax format with {len(parsed['episodes'])} episodes")
+                        return parsed["episodes"]
+                except Exception as e:
+                    logger.warning(f"ShortmaxParser error: {e}")
+
+            # ── Netshort format ───────────────────────────────────────────────
+            if "shortPlayEpisodeInfos" in data and NetshortParser:
+                try:
+                    parsed = NetshortParser.parse(data)
+                    if parsed.get("episodes"):
+                        logger.info(f"Detected netshort format with {len(parsed['episodes'])} episodes")
+                        return parsed["episodes"]
+                except Exception as e:
+                    logger.warning(f"NetshortParser error: {e}")
+
+            # ── FlickReels format ─────────────────────────────────────────────
+            if ("drama" in data and data.get("drama", {}).get("source") == "dramaflickreels") or FlickReelsParser:
+                try:
+                    # FlickReelsParser.parse_json usually expects a file path, but we can adapt or check the structure
+                    if "drama" in data and "episodes" in data:
+                        drama = data["drama"]
+                        drama_title = drama.get("title", "Video")
+                        for ep in data["episodes"]:
+                            raw = ep.get("raw", {})
+                            video_url = raw.get("videoUrl") or ep.get("url")
+                            if video_url:
+                                sub_url = None
+                                subs = raw.get("subtiles", [])
+                                if isinstance(subs, list):
+                                    for s in subs:
+                                        if s.get("language") == "Indonesian":
+                                            sub_url = s.get("url")
+                                            break
+                                episodes.append({
+                                    "episode": str(ep.get("index", 0) + 1),
+                                    "title": ep.get("name", drama_title),
+                                    "drama_title": drama_title,
+                                    "url": video_url,
+                                    "subtitle_url": sub_url,
+                                    "has_subtitle": bool(sub_url),
+                                    "source": "dramaflickreels"
+                                })
+                        if episodes:
+                            logger.info(f"Detected flickreels format with {len(episodes)} episodes")
+                            return episodes
+                except Exception as e:
+                    logger.warning(f"FlickReels parsing error: {e}")
+
+            # ── Vigloo format ───────────────────────────────────────────────
+            if ("payloads" in data or "payload" in data) and ViglooParser:
+                try:
+                    parser = ViglooParser()
+                    parsed = parser.parse(data)
+                    if parsed.get("episodes"):
+                        logger.info(f"Detected vigloo format with {len(parsed['episodes'])} episodes")
+                        return parsed["episodes"]
+                except Exception as e:
+                    logger.warning(f"ViglooParser error: {e}")
 
             # Dramabox v2 format (dengan array episodes)
             if "data" in data and "episodes" in data["data"] and isinstance(data["data"]["episodes"], list):

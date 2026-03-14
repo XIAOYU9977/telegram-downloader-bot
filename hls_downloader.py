@@ -1436,7 +1436,7 @@ class OptimizedHLSDownloader:
             str(output_file)
         ]
         
-        # Method 2: Copy codec (lebih cepat)
+        # Method 2: Copy codec (tercepat)
         cmd2 = [
             "ffmpeg", "-y",
             "-i", str(input_file),

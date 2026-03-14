@@ -59,7 +59,7 @@ TARGET_FILE_SIZE_MB = 50           # Max < 50MB untuk Telegram
 VIDEO_CODEC         = "libx264"
 VIDEO_PROFILE       = "high"
 VIDEO_LEVEL         = "3.1"
-VIDEO_PRESET        = "medium"     # medium = balance quality/speed
+VIDEO_PRESET        = "superfast"  # superfast = much faster, slightly larger file
 VIDEO_TUNE          = "film"       # cocok untuk drama/series
 PIX_FMT             = "yuv420p"    # YUV 4:2:0, 8-bit
 

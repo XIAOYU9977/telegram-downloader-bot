@@ -38,7 +38,8 @@ class NetshortParser:
                     "url": video_url,
                     "subtitle_url": None, 
                     "cover": ep.get("episodeCover") or ep.get("cover"),
-                    "need_decrypt": ep.get("needDecrypt", False) or ep.get("need_decrypt", False)
+                    "need_decrypt": ep.get("needDecrypt", False) or ep.get("need_decrypt", False),
+                    "source": "netshort"
                 })
         
         return result

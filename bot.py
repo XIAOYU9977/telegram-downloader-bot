@@ -966,162 +966,23 @@ class DownloaderBot:
             # Buat session baru
             self.session_manager.create_session(user_id, data, str(json_path))
 
-            # ── Deteksi format velolo — kirim cover + caption judul ───────────
-            velolo_cover_url, velolo_title = self._extract_velolo_cover(data)
-            if velolo_cover_url and velolo_title:
-                try:
-                    await update.message.reply_photo(
-                        photo=velolo_cover_url,
-                        caption=f"🎬 <b>{velolo_title}</b>",
-                        parse_mode="HTML"
-                    )
-                    logger.info(f"[velolo] Cover terkirim: {velolo_title}")
-                except Exception as cover_err:
-                    logger.warning(f"[velolo] Gagal kirim cover: {cover_err}")
-
-                # Ekstrak semua episode velolo langsung
-                all_episodes = self._extract_velolo_episodes(data)
-                if all_episodes:
-                    context.user_data['episodes'] = all_episodes
-                    context.user_data['total_episodes'] = len(all_episodes)
-                    context.user_data['drama_title'] = velolo_title
-                    context.user_data['json_path'] = str(json_path)
-
-                    eps_with_sub = sum(1 for ep in all_episodes if ep.get('subtitle_url'))
-
-                    # Tanya mode subtitle jika ada subtitle
-                    if eps_with_sub > 0:
-                        await update.message.reply_text(
-                            f"📝 <b>Subtitle Indonesia terdeteksi</b> ({eps_with_sub} episode)\n\n"
-                            "Pilih cara memproses subtitle:\n\n"
-                            "  <b>1</b> → 💬 Softsub (embedded track, bisa dimatikan)\n"
-                            "  <b>2</b> → 🔥 Hardsub (subtitle dibakar ke video)\n"
-                            "  <b>3</b> → 📄 Subtitle terpisah (.srt dikirim sendiri)\n"
-                            "  <b>4</b> → 🚫 Tanpa subtitle\n\n"
-                            "Ketik <b>BATAL</b> untuk membatalkan.",
-                            parse_mode="HTML"
-                        )
-                        return AWAITING_DRAMAWAVE_SUBTITLE
-
-                    # Tidak ada subtitle — langsung ke pilihan episode
-                    for ep in all_episodes:
-                        ep['subtitle_mode'] = 'none'
-
-                    episode_list = "\n".join([
-                        f"• Episode {ep['episode']}: {'[SUB] ' if ep.get('subtitle_url') else ''}{ep['title'][:30]}"
-                        for ep in all_episodes[:10]
-                    ])
-                    if len(all_episodes) > 10:
-                        episode_list += f"\n• ... dan {len(all_episodes) - 10} episode lainnya"
-
-                    choice_text = (
-                        f"📋 <b>Ditemukan {len(all_episodes)} Episode</b>\n\n"
-                        f"Judul: {velolo_title}\n"
-                        f"Subtitle Indonesia: {eps_with_sub} episode\n\n"
-                        f"Daftar Episode:\n{episode_list}\n\n"
-                        "📝 <b>Pilihan Download:</b>\n\n"
-                        "Ketik nomor episode (contoh: 1, 1-5, 1,3,5)\n"
-                        "Atau ketik <b>SEMUA</b> untuk download semua episode\n"
-                        "Ketik <b>BATAL</b> untuk membatalkan\n\n"
-                        "<i>File akan otomatis dihapus setelah selesai</i>"
-                    )
-                    await update.message.reply_text(choice_text, parse_mode="HTML")
-                    return AWAITING_BATCH_CHOICE
-                else:
-                    await update.message.reply_text(
-                        "❌ Tidak ada episode yang dapat ditemukan dalam JSON velolo."
-                    )
-                    await self._cleanup_user_session(user_id, context, "velolo: tidak ada episode")
-                    return ConversationHandler.END
-            # ── End velolo ────────────────────────────────────────────────────
-
-            # ── Deteksi format dramawave — kirim cover + tanya subtitle ───────
-            if self._is_dramawave(data):
-                dw = self._extract_dramawave_info(data)
-                drama_title   = dw["name"]
-                cover_url     = dw["cover_url"]
-                desc          = dw["desc"]
-                all_episodes  = dw["episodes"]
-                eps_with_sub  = dw["eps_with_sub"]
-
-                # Kirim cover + info drama
-                if cover_url:
-                    try:
-                        # Potong desc agar tidak terlalu panjang untuk caption Telegram
-                        short_desc = desc[:300] + ("…" if len(desc) > 300 else "")
-                        tags = data["data"]["info"].get("content_tags", [])
-                        tags_str = " • ".join(tags[:4]) if tags else ""
-
-                        caption = (
-                            f"🎬 <b>{drama_title}</b>\n\n"
-                            + (f"🏷 {tags_str}\n\n" if tags_str else "")
-                            + f"📖 {short_desc}"
-                        )
-                        await update.message.reply_photo(
-                            photo=cover_url,
-                            caption=caption,
-                            parse_mode="HTML"
-                        )
-                        logger.info(f"[dramawave] Cover terkirim: {drama_title}")
-                    except Exception as cover_err:
-                        logger.warning(f"[dramawave] Gagal kirim cover: {cover_err}")
-
-                if not all_episodes:
-                    await update.message.reply_text(
-                        "❌ Tidak ada episode yang dapat ditemukan dalam JSON dramawave."
-                    )
-                    await self._cleanup_user_session(user_id, context, "dramawave: tidak ada episode")
-                    return ConversationHandler.END
-
-                context.user_data['episodes']       = all_episodes
-                context.user_data['total_episodes'] = len(all_episodes)
-                context.user_data['drama_title']    = drama_title
-                context.user_data['json_path']      = str(json_path)
-
-                # Tanya pilihan subtitle jika ada subtitle Indonesia
-                if eps_with_sub > 0:
-                    await update.message.reply_text(
-                        f"📝 <b>Subtitle Indonesia terdeteksi</b> ({eps_with_sub} episode)\n\n"
-                        "Pilih cara memproses subtitle:\n\n"
-                        "  <b>1</b> → 💬 Softsub (embedded track, bisa dimatikan)\n"
-                        "  <b>2</b> → 🔥 Hardsub (subtitle dibakar ke video)\n"
-                        "  <b>3</b> → 📄 Subtitle terpisah (.srt dikirim sendiri)\n"
-                        "  <b>4</b> → 🚫 Tanpa subtitle\n\n"
-                        "Ketik <b>BATAL</b> untuk membatalkan.",
-                        parse_mode="HTML"
-                    )
-                    return AWAITING_DRAMAWAVE_SUBTITLE
-                else:
-                    # Tidak ada subtitle, langsung ke pemilihan episode
-                    for ep in all_episodes:
-                        ep["subtitle_mode"] = "none"
-                    episode_list_text = "\n".join([
-                        f"• Episode {ep['episode']}: {ep['title'][:30]}"
-                        for ep in all_episodes[:10]
-                    ])
-                    if len(all_episodes) > 10:
-                        episode_list_text += f"\n• ... dan {len(all_episodes) - 10} episode lainnya"
-                    choice_text = (
-                        f"📋 <b>Ditemukan {len(all_episodes)} Episode</b>\n\n"
-                        f"Judul: {drama_title}\n\n"
-                        f"Daftar Episode:\n{episode_list_text}\n\n"
-                        "📝 <b>Pilihan Download:</b>\n\n"
-                        "Ketik nomor episode (contoh: 1, 1-5, 1,3,5)\n"
-                        "Atau ketik <b>SEMUA</b> untuk download semua episode\n"
-                        "Ketik <b>BATAL</b> untuk membatalkan\n\n"
-                        "<i>File akan otomatis dihapus setelah selesai</i>"
-                    )
-                    await update.message.reply_text(choice_text, parse_mode="HTML")
-                    return AWAITING_BATCH_CHOICE
-            # ── End dramawave ─────────────────────────────────────────────────
-
-            # ── Gunakan Universal Parser ──────────────────────────────────────
+            # ── Gunakan Universal Parser yang telah ditingkatkan ──────────────────
             universal_data = JSONParser.universal_parse(data)
-            video_url = universal_data.get("url")
-            subtitle_url = universal_data.get("subtitle_url")
             all_episodes = universal_data.get("all_episodes", [])
             drama_title = universal_data.get("title", "Video")
             cover_url = universal_data.get("cover_url")
+            source = universal_data.get("source", "unknown")
+
+            # ── Special processing: Vigloo async URL filling ──────────────────
+            if source == "vigloo" and all_episodes and ViglooParser:
+                status_filling = await update.message.reply_text("🔍 Fetching episode details from Vigloo...")
+                try:
+                    vigloo_parser = ViglooParser()
+                    all_episodes = await vigloo_parser.fill_urls(all_episodes)
+                    await status_filling.delete()
+                except Exception as e:
+                    logger.error(f"Vigloo URL filling failed: {e}")
+                    await status_filling.edit_text("⚠️ Gagal mengambil detail dari Vigloo.")
 
             if cover_url:
                 try:
@@ -1130,74 +991,91 @@ class DownloaderBot:
                         caption=f"🎬 <b>{drama_title}</b>",
                         parse_mode="HTML"
                     )
-                    logger.info(f"JSON Cover sent: {drama_title}")
-                except Exception as cover_err:
-                    logger.warning(f"Failed to send JSON cover: {cover_err}")
+                except Exception:
+                    pass
 
-            if subtitle_url:
-                logger.info(f"Indonesian subtitle detected: {subtitle_url[:100]}...")
-            
-            if not video_url and not all_episodes:
-                await update.message.reply_text(
-                    "❌ Tidak dapat menemukan URL video (MP4/M3U8) dalam file JSON ini.\n\n"
-                    "Pastikan JSON berisi field seperti: <code>url, stream_url, m3u8, mp4, play_url</code>"
-                )
-                await self._cleanup_user_session(user_id, context, "URL tidak ditemukan")
-                return ConversationHandler.END
-            
             if not all_episodes:
-                title, episode, has_subtitle = self.extract_title_episode(data, filename)
+                # Fallback ke video_url tunggal jika tidak ada array episode
+                video_url = universal_data.get("url")
+                subtitle_url = universal_data.get("subtitle_url")
                 
-                context.user_data['episodes'] = [{
+                if not video_url:
+                    await update.message.reply_text("❌ Tidak dapat menemukan episode atau URL video dalam JSON ini.")
+                    await self._cleanup_user_session(user_id, context, "tidak ada episode")
+                    return ConversationHandler.END
+
+                title, episode, has_subtitle = self.extract_title_episode(data, filename)
+                all_episodes = [{
                     "episode": episode,
                     "title": title,
                     "url": video_url,
                     "subtitle_url": subtitle_url
                 }]
-                context.user_data['total_episodes'] = 1
-                context.user_data['drama_title'] = title
-                context.user_data['json_path'] = str(json_path)
-                
-                if subtitle_url:
-                    await update.message.reply_text(
-                        f"📋 <b>Video Ditemukan</b>\n\n"
-                        f"Judul: {title}\n"
-                        f"Episode: {episode}\n\n"
-                        f"📝 <b>Subtitle Indonesia terdeteksi</b>\n\n"
-                        "Pilih cara memproses subtitle:\n\n"
-                        "  <b>1</b> → 💬 Softsub (embedded track, bisa dimatikan)\n"
-                        "  <b>2</b> → 🔥 Hardsub (subtitle dibakar ke video)\n"
-                        "  <b>3</b> → 📄 Subtitle terpisah (.srt dikirim sendiri)\n"
-                        "  <b>4</b> → 🚫 Tanpa subtitle\n\n"
-                        "Ketik <b>BATAL</b> untuk membatalkan.",
-                        parse_mode="HTML"
-                    )
-                    return AWAITING_SOFTSUB_CHOICE
-                
-                subtitle_text = "Tidak"
+                drama_title = title
+
+            context.user_data['episodes'] = all_episodes
+            context.user_data['total_episodes'] = len(all_episodes)
+            context.user_data['drama_title'] = drama_title
+            context.user_data['json_path'] = str(json_path)
+
+            eps_with_sub = sum(1 for ep in all_episodes if ep.get('subtitle_url'))
+            
+            # Tanya mode subtitle jika ada subtitle Indonesia
+            if eps_with_sub > 0:
+                await update.message.reply_text(
+                    f"📝 <b>Subtitle Indonesia terdeteksi</b> ({eps_with_sub} episode)\n\n"
+                    "Pilih cara memproses subtitle:\n\n"
+                    "  <b>1</b> → 💬 Softsub (embedded track, bisa dimatikan)\n"
+                    "  <b>2</b> → 🔥 Hardsub (subtitle dibakar ke video)\n"
+                    "  <b>3</b> → 📄 Subtitle terpisah (.srt dikirim sendiri)\n"
+                    "  <b>4</b> → 🚫 Tanpa subtitle\n\n"
+                    "Ketik <b>BATAL</b> untuk membatalkan.",
+                    parse_mode="HTML"
+                )
+                return AWAITING_SOFTSUB_CHOICE if len(all_episodes) == 1 else AWAITING_DRAMAWAVE_SUBTITLE
+
+            # Tidak ada subtitle, langsung ke pemilihan episode
+            for ep in all_episodes:
+                ep["subtitle_mode"] = "none"
+            
+            if len(all_episodes) == 1:
+                # Langsung konfirmasi jika cuma 1 episode
+                ep = all_episodes[0]
                 confirmation_text = (
                     "📋 <b>Konfirmasi Data</b>\n\n"
-                    f"Judul: {title}\n"
-                    f"Episode: {episode}\n"
-                    f"Subtitle Indonesia: {subtitle_text}\n\n"
+                    f"Judul: {drama_title}\n"
+                    f"Episode: {ep['episode']}\n"
+                    f"Subtitle Indonesia: Tidak Ada\n\n"
                     "Ketik:\n"
                     "<b>OK</b> → untuk mulai proses\n"
                     "<b>BATAL</b> → untuk membatalkan\n\n"
                     "<i>File akan otomatis dihapus setelah selesai</i>"
                 )
-                
                 await update.message.reply_text(confirmation_text, parse_mode="HTML")
                 return AWAITING_CONFIRMATION
-            
             else:
-                drama_title, _, _ = self.extract_title_episode(data, filename)
-                
-                context.user_data['episodes'] = all_episodes
-                context.user_data['total_episodes'] = len(all_episodes)
-                context.user_data['drama_title'] = drama_title
-                context.user_data['json_path'] = str(json_path)
-                
-                eps_with_sub = sum(1 for ep in all_episodes if ep.get('subtitle_url'))
+                # Multi-episode → tampilkan daftar
+                episode_list = "\n".join([
+                    f"• Episode {ep['episode']}: {'[SUB] ' if ep.get('subtitle_url') else ''}{ep['title'][:30]}"
+                    for ep in all_episodes[:10]
+                ])
+                if len(all_episodes) > 10:
+                    episode_list += f"\n• ... dan {len(all_episodes) - 10} episode lainnya"
+
+                choice_text = (
+                    f"📋 <b>Ditemukan {len(all_episodes)} Episode</b>\n\n"
+                    f"Judul: {drama_title}\n"
+                    f"Subtitle Indonesia: {eps_with_sub} episode\n\n"
+                    f"Daftar Episode:\n{episode_list}\n\n"
+                    "📝 <b>Pilihan Download:</b>\n\n"
+                    "Ketik nomor episode (contoh: 1, 1-5, 1,3,5)\n"
+                    "Atau ketik <b>SEMUA</b> untuk download semua episode\n"
+                    "Ketik <b>BATAL</b> untuk membatalkan\n\n"
+                    "<i>File akan otomatis dihapus setelah selesai</i>"
+                )
+                await update.message.reply_text(choice_text, parse_mode="HTML")
+                return AWAITING_BATCH_CHOICE
+
                 
                 # Tanya mode subtitle jika ada episode dengan subtitle
                 if eps_with_sub > 0:
