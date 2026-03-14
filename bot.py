@@ -2876,7 +2876,7 @@ def main():
     app.add_handler(CommandHandler("cancel", bot.cancel))
     app.add_handler(CallbackQueryHandler(bot.handle_settings_choice, pattern="^set_"))
     app.add_handler(CallbackQueryHandler(bot.handle_confirmation_button, pattern="^conf_"))
-    app.add_handler(CallbackQueryHandler(bot.handle_callback_mi, pattern="^mi\|"))
+    app.add_handler(CallbackQueryHandler(bot.handle_callback_mi, pattern=r"^mi\|"))
     app.add_handler(CallbackQueryHandler(bot.handle_close_mi, pattern="^close_mi$"))
     app.add_handler(conv_handler)
     app.add_error_handler(bot.error_handler)
