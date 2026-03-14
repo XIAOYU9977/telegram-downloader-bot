@@ -2136,6 +2136,8 @@ class DownloaderBot:
 
                     elif ep_subtitle_mode == "embed":
                         try:
+                            async def burn_progress(current):
+                                if not is_batch:
                                     try:
                                         await self.uploader.update_message(
                                             user_id,
