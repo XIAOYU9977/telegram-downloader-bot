@@ -905,16 +905,30 @@ class JSONParser:
             is_melo = ("drama_title" in data.get("data", {}) or "chapters" in data.get("data", {}))
             if is_melo:
                 d = data["data"]
-                            subtitle_url = SubtitleDetector.get_subtitle_url(indo_sub)
-                    
-                    if video_url:
-                        episodes.append({
-                            "episode": episode_num,
-                            "title": d.get("drama_title", "Video"),
-                            "url": video_url,
-                            "subtitle_url": subtitle_url,
-                            "source": "meloshort"
-                        })
+                drama_title = d.get("drama_title", "Drama")
+                chapters = d.get("chapters", [d])
+                if isinstance(chapters, list):
+                    logger.info("Detected meloshort format")
+                    for item in chapters:
+                        ep_num = str(item.get("chapter_index", item.get("index", 1)))
+                        v_url = item.get("play_url")
+                        sub_url = None
+                        if item.get("sublist"):
+                            indo = SubtitleDetector.find_indonesian_subtitle(item["sublist"])
+                            if indo: sub_url = SubtitleDetector.get_subtitle_url(indo)
+                        
+                        if v_url:
+                            episodes.append({
+                                "episode": ep_num,
+                                "title": f"Episode {ep_num}",
+                                "drama_title": drama_title,
+                                "url": v_url,
+                                "subtitle_url": sub_url,
+                                "source": "meloshort"
+                            })
+                    if episodes:
+                        episodes.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
+                        return episodes
             
             # Vigloo format
             elif "payload" in data and "url" in data["payload"]:
