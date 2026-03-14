@@ -2254,8 +2254,6 @@ class DownloaderBot:
                         except Exception as sub_err:
                             logger.warning(f"[sub-separate] Gagal kirim subtitle: {sub_err}")
 
-                    except Exception:
-                        pass
 
                 except Exception as e:
                     logger.error(f"Upload failed for episode {episode_num}: {e}")
