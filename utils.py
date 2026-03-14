@@ -619,6 +619,51 @@ class JSONParser:
         episodes = []
         
         try:
+            # ── Dotdrama format ────────────────────────────────────────────────
+            if "dgiv" in data and isinstance(data["dgiv"], dict):
+                dgiv = data["dgiv"]
+                drama_info = dgiv.get("bswitc", {})
+                drama_title = drama_info.get("nseri", "Drama")
+                ebeer = dgiv.get("ebeer", [])
+                logger.info(f"Detected dotdrama format with {len(ebeer)} episodes")
+                for item in ebeer:
+                    ep_num = str(item.get("ewheel", 1))
+                    pphys = item.get("pphys", [])
+                    video_url = None
+                    if pphys:
+                        # Mopp or Bcold
+                        video_url = pphys[0].get("Mopp") or pphys[0].get("Bcold")
+                    
+                    if video_url:
+                        episodes.append({
+                            "episode": ep_num,
+                            "title": drama_title,
+                            "url": video_url,
+                            "subtitle_url": None,
+                            "source": "dotdrama"
+                        })
+                episodes.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
+                return episodes
+
+            # ── Pocinca format ─────────────────────────────────────────────────
+            if "series" in data and "videos" in data and isinstance(data["videos"], list):
+                drama_title = data["series"].get("title", "Drama")
+                videos = data["videos"]
+                logger.info(f"Detected pocinca format with {len(videos)} episodes")
+                for item in videos:
+                    ep_num = str(item.get("index", 1))
+                    video_url = item.get("main_url") or item.get("backup_url")
+                    if video_url:
+                        episodes.append({
+                            "episode": ep_num,
+                            "title": drama_title,
+                            "url": video_url,
+                            "subtitle_url": None,
+                            "source": "pocinca"
+                        })
+                episodes.sort(key=lambda x: int(x["episode"]) if x["episode"].isdigit() else 0)
+                return episodes
+
             # ── Velolo format ──────────────────────────────────────────────────
             if "videoInfo" in data and "episodesInfo" in data:
                 drama_title = data["videoInfo"].get("name", "Video")
@@ -920,8 +965,23 @@ class JSONParser:
                             "episode": episode_num,
                             "title": d.get("drama_title", "Video"),
                             "url": video_url,
-                            "subtitle_url": subtitle_url
+                            "subtitle_url": subtitle_url,
+                            "source": "meloshort"
                         })
+            
+            # Vigloo format
+            elif "payload" in data and "url" in data["payload"]:
+                payload = data["payload"]
+                video_url = payload.get("url")
+                cookies = payload.get("cookies", {})
+                logger.info("Detected vigloo format with cookies")
+                episodes.append({
+                    "episode": "1",
+                    "title": "Vigloo Video",
+                    "url": video_url,
+                    "cookies": cookies,
+                    "source": "vigloo"
+                })
             
             # Shortmax format
             elif ("videoUrl" in data or "shortPlayId" in data) and ShortmaxParser:
@@ -987,6 +1047,10 @@ class JSONParser:
                         video_url = item["video_url"]
                     elif "m3u8_url" in item and item["m3u8_url"]:
                         video_url = item["m3u8_url"]
+                    
+                    if not video_url:
+                        # Fallback for empty url field in some formats
+                        video_url = item.get("url") or item.get("video_url")
                     
                     subtitle_url = None
                     subs = item.get("subtitle_list")

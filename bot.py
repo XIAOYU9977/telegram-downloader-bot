@@ -2001,11 +2001,14 @@ class DownloaderBot:
                         await self.uploader.update_message(
                             user_id,
                             status_msg.message_id,
-                            f"📥 <b>Downloading episode {idx}/{len(selected_episodes)}</b>\n"
-                            f"Episode: {episode_num}"
+                            f"📥 <b>Downloading: {drama_title} — Ep {episode_num}</b>\n"
+                            f"<i>{idx}/{len(selected_episodes)} episode</i>"
                         )
                 except:
                     pass
+
+                # Check for Vigloo cookies
+                cookies = episode_data.get('cookies')
 
                 safe_title = "".join(c for c in drama_title if c.isalnum() or c in ' ._-')[:30]
                 safe_episode = f"EP{episode_num.zfill(2) if episode_num.isdigit() else episode_num}"
@@ -2030,8 +2033,8 @@ class DownloaderBot:
                                 await self.uploader.update_message(
                                     user_id,
                                     status_msg.message_id,
-                                    f"⬇️ <b>Downloading Episode {episode_num}...</b>\n"
-                                    f"Size: {format_size(current)}"
+                                    f"📥 <b>Downloading: {drama_title} — Ep {episode_num}</b>\n"
+                                    f"📦 Size: {format_size(current)}"
                                 )
                             except:
                                 pass
@@ -2042,6 +2045,7 @@ class DownloaderBot:
                             output_path=video_path,
                             user_id=user_id,
                             progress_callback=video_progress if not is_batch else None,
+                            headers=cookies,  # Pass Vigloo cookies if present
                             subtitle_mode="none",
                             target_resolution=user_res,
                             output_format=user_fmt
@@ -2052,6 +2056,11 @@ class DownloaderBot:
                     if not downloaded_video:
                         failed += 1
                         logger.error(f"Download failed for episode {episode_num}")
+                        await self.uploader.update_message(
+                            user_id, status_msg.message_id,
+                            f"❌ <b>Gagal: {drama_title} — Ep {episode_num}</b>\n"
+                            f"<i>Download error - Episode dilewati</i>"
+                        )
                         await FileCleanup.cleanup_episode_files(
                             video_path=video_path if video_path.exists() else None,
                             subtitle_path=subtitle_path if subtitle_path.exists() else None,
@@ -2083,7 +2092,7 @@ class DownloaderBot:
                         await self.uploader.update_message(
                             user_id,
                             status_msg.message_id,
-                            f"⬇️ <b>Downloading subtitle Indonesia Episode {episode_num}...</b>"
+                            f"📥 <b>Downloading: {drama_title} — Subtitle Ep {episode_num}</b>"
                         )
 
                         subtitle_file = await self.download_manager.download_subtitle(
@@ -2107,7 +2116,7 @@ class DownloaderBot:
                             await self.uploader.update_message(
                                 user_id,
                                 status_msg.message_id,
-                                f"💬 <b>Embedding softsub Episode {episode_num}...</b>"
+                                f"🛠️ <b>Processing: {drama_title} — Softsub Ep {episode_num}</b>"
                             )
                             processed_video = await asyncio.wait_for(
                                 self.video_processor.embed_softsub(
@@ -2127,20 +2136,12 @@ class DownloaderBot:
 
                     elif ep_subtitle_mode == "embed":
                         try:
-                            await self.uploader.update_message(
-                                user_id,
-                                status_msg.message_id,
-                                f"🔥 <b>Burning hardsub Episode {episode_num}...</b>"
-                            )
-
-                            async def burn_progress(current):
-                                if not is_batch:
                                     try:
                                         await self.uploader.update_message(
                                             user_id,
                                             status_msg.message_id,
-                                            f"🔥 <b>Processing Episode {episode_num}...</b>\n"
-                                            f"Size: {format_size(current)}"
+                                            f"🛠️ <b>Processing: {drama_title} — Hardsub Ep {episode_num}</b>\n"
+                                            f"📦 Size: {format_size(current)}"
                                         )
                                     except:
                                         pass
@@ -2171,7 +2172,7 @@ class DownloaderBot:
                         mkv_path = final_video.with_suffix(".mkv")
                         await self.uploader.update_message(
                             user_id, status_msg.message_id,
-                            f"⚙️ <b>Remuxing ke MKV Episode {episode_num}...</b>"
+                            f"🛠️ <b>Processing: {drama_title} — Remux MKV Ep {episode_num}</b>"
                         )
                         cmd = [
                             "ffmpeg", "-y", "-i", str(final_video),
@@ -2226,7 +2227,11 @@ class DownloaderBot:
 
                     if not upload_ok:
                         failed += 1
-                        logger.error(f"Upload gagal ep {episode_num}")
+                        await self.uploader.update_message(
+                            user_id, status_msg.message_id,
+                            f"❌ <b>Gagal: {drama_title} — Ep {episode_num}</b>\n"
+                            f"<i>Upload error - Episode dilewati</i>"
+                        )
                         continue
 
                     successful += 1
@@ -2247,21 +2252,6 @@ class DownloaderBot:
                         except Exception as sub_err:
                             logger.warning(f"[sub-separate] Gagal kirim subtitle: {sub_err}")
 
-                    # Update status progress
-                    try:
-                        progress_text = (
-                            f"✅ <b>Progress: {idx}/{len(selected_episodes)}</b>\n"
-                            f"Episode {episode_num} selesai"
-                        ) if is_batch else (
-                            f"✅ <b>Upload selesai</b>\n\n"
-                            f"🎬 {drama_title} Ep {episode_num}"
-                        )
-                        await context.bot.edit_message_text(
-                            chat_id=user_id,
-                            message_id=status_msg.message_id,
-                            text=progress_text,
-                            parse_mode="HTML"
-                        )
                     except Exception:
                         pass
 
@@ -2286,23 +2276,21 @@ class DownloaderBot:
             # Final status
             if is_batch:
                 final_text = (
-                    f"✅ <b>Batch Download Selesai!</b>\n\n"
-                    f"Berhasil: {successful} episode\n"
-                    f"Gagal: {failed} episode\n\n"
-                    f"<i>Semua file telah dibersihkan</i>"
+                    f"✅ <b>Selesai: {drama_title}</b>\n\n"
+                    f"📦 Berhasil: {successful} episode\n"
+                    f"❌ Gagal: {failed} episode\n\n"
+                    f"<i>Seluruh file sementara telah dihapus.</i>"
                 )
                 try:
-                    await self.uploader.update_message(
-                        user_id,
-                        status_msg.message_id,
-                        final_text
-                    )
+                    await self.uploader.update_message(user_id, status_msg.message_id, final_text)
                 except:
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=final_text,
-                        parse_mode="HTML"
-                    )
+                    await context.bot.send_message(chat_id=user_id, text=final_text, parse_mode="HTML")
+            else:
+                final_text = f"✅ <b>Selesai: {drama_title} — Ep {selected_episodes[0]['episode']}</b>"
+                try:
+                    await self.uploader.update_message(user_id, status_msg.message_id, final_text)
+                except:
+                    await context.bot.send_message(chat_id=user_id, text=final_text, parse_mode="HTML")
 
         except Exception as e:
             logger.error(f"Error in batch processing: {e}")
@@ -2310,7 +2298,7 @@ class DownloaderBot:
                 await self.uploader.update_message(
                     user_id,
                     status_msg.message_id,
-                    f"❌ <b>Error:</b> {str(e)}\n\n<i>Membersihkan file...</i>"
+                    f"❌ <b>Gagal:</b> {str(e)}\n\n<i>Membersihkan file...</i>"
                 )
             except:
                 pass
@@ -2361,16 +2349,16 @@ class DownloaderBot:
                         await self.uploader.update_message(
                             user_id, status_msg.message_id,
                             f"{batch_header}"
-                            f"⬇️ <b>Mendownload segmen:</b> {display_title}\n"
-                            f"📦 Segmen terunduh: {current_bytes} segmen\n"
-                            f"<i>💡 Menggunakan parallel download</i>"
+                            f"📥 <b>Downloading: {display_title}</b>\n"
+                            f"📦 Progress: {current_bytes} segmen\n"
+                            f"<i>💡 Optimizing with parallel download</i>"
                         )
                     else:
                         await self.uploader.update_message(
                             user_id, status_msg.message_id,
                             f"{batch_header}"
-                            f"⬇️ <b>Mendownload:</b> {display_title}\n"
-                            f"📦 Terunduh: {format_size(current_bytes)}"
+                            f"📥 <b>Downloading: {display_title}</b>\n"
+                            f"📦 Size: {format_size(current_bytes)}"
                         )
                 except Exception:
                     pass
@@ -2403,10 +2391,8 @@ class DownloaderBot:
                 logger.error(f"[dl] Gagal: {raw_url}")
                 await self._safe_update(
                     user_id, status_msg,
-                    f"{batch_header}❌ <b>{display_title}</b> — download gagal.\n"
-                    f"• Link tidak valid atau sudah kadaluarsa\n"
-                    f"• Server menolak koneksi\n"
-                    f"• Format stream tidak didukung"
+                    f"{batch_header}❌ <b>Gagal: {display_title}</b>\n"
+                    f"<i>Link tidak valid atau format tidak didukung.</i>"
                 )
                 return False
 
@@ -2446,7 +2432,7 @@ class DownloaderBot:
                     try:
                         await self._safe_update(
                             user_id, status_msg,
-                            f"{batch_header}⬇️ <b>Mendownload subtitle:</b> {display_title}..."
+                            f"{batch_header}📥 <b>Downloading: {display_title} — Subtitle...</b>"
                         )
                         sub_ext = ".vtt" if ".vtt" in subtitle_url.lower() else ".srt"
                         sub_stem = video_path.stem
@@ -2464,7 +2450,7 @@ class DownloaderBot:
                     try:
                         await self._safe_update(
                             user_id, status_msg,
-                            f"{batch_header}💬 <b>Embedding softsub:</b> {display_title}..."
+                            f"{batch_header}🛠️ <b>Processing: {display_title} — Softsub...</b>"
                         )
                         # Gunakan output_path yang valid
                         processed = await self.video_processor.embed_softsub(
@@ -2483,7 +2469,7 @@ class DownloaderBot:
                     try:
                         await self._safe_update(
                             user_id, status_msg,
-                            f"{batch_header}🔥 <b>Burning hardsub:</b> {display_title}..."
+                            f"{batch_header}🛠️ <b>Processing: {display_title} — Hardsub...</b>"
                         )
                         processed = await self.video_processor.burn_subtitle(
                             downloaded_path, subtitle_path, output_path, user_id, None, "id"
@@ -2521,9 +2507,8 @@ class DownloaderBot:
             file_size = downloaded_path.stat().st_size
             file_size_mb = file_size / (1024 * 1024)
             
-            upload_msg = f"{batch_header}📤 <b>Mengupload:</b> {display_title}\n"
-            upload_msg += f"📁 <b>File:</b> {filename}\n"
-            upload_msg += f"📦 <b>Ukuran:</b> {format_size(file_size)}"
+            upload_msg = f"{batch_header}📤 <b>Uploading: {display_title}</b>\n"
+            upload_msg += f"📦 Size: {format_size(file_size)}"
             
             await self._safe_update(user_id, status_msg, upload_msg)
 
@@ -2570,9 +2555,8 @@ class DownloaderBot:
             if cleanup_session:
                 await self._safe_update(
                     user_id, status_msg,
-                    f"✅ <b>Download selesai</b>\n\n"
-                    f"📁 <b>File:</b> {filename}\n"
-                    f"📦 <b>Ukuran:</b> {format_size(file_size)}"
+                    f"✅ <b>Selesai: {display_title}</b>\n\n"
+                    f"<i>File sementara telah dihapus.</i>"
                 )
             success = True
 
@@ -2580,8 +2564,8 @@ class DownloaderBot:
             logger.error(f"[dl] Error: {display_title}: {exc}", exc_info=True)
             await self._safe_update(
                 user_id, status_msg,
-                f"{batch_header}❌ <b>{display_title}</b> — error tidak terduga.\n"
-                f"<code>{str(exc)[:200]}</code>"
+                f"{batch_header}❌ <b>Gagal: {display_title}</b>\n"
+                f"<code>General processing error.</code>"
             )
 
         finally:
@@ -2649,9 +2633,8 @@ class DownloaderBot:
                         logger.warning(f"[batch] Deteksi subtitle ep{idx} gagal: {e}")
 
                 batch_header = (
-                    f"📥 <b>Batch Download</b>  —  🎬 {series_title}\n"
+                    f"🛠️ <b>Processing Batch: {series_title}</b>\n"
                     f"📦 Progress: <b>{idx}/{total}</b> episode\n\n"
-                    f"⏳ <b>Memproses Episode {idx}...</b>\n"
                 )
 
                 await self._safe_update(user_id, status_msg, batch_header)
@@ -2692,12 +2675,13 @@ class DownloaderBot:
             status = "Semua berhasil!" if failed == 0 else f"{successful} berhasil, {failed} gagal"
 
             final_text = (
-                f"{icon} <b>Batch Download Selesai</b>\n\n"
-                f"🎬 <b>Series:</b> {series_title}\n"
-                f"📦 <b>Total:</b> {total} episode\n"
-                f"📊 <b>Status:</b> {status}\n\n"
+                f"✅ <b>Selesai: {series_title}</b>\n\n"
+                f"📊 <b>Ringkasan:</b>\n"
+                f"• Total: {total} episode\n"
+                f"• Berhasil: {successful}\n"
+                f"• Gagal: {failed}\n\n"
                 + "\n".join(shown)
-                + "\n\n<i>Semua file lokal telah dibersihkan.</i>"
+                + "\n\n<i>Seluruh file sementara telah dihapus.</i>"
             )
             await self._safe_update(user_id, status_msg, final_text)
 
@@ -2721,7 +2705,7 @@ class DownloaderBot:
         if not url.startswith(("http://", "https://")):
             return
             
-        status_msg = await update.message.reply_text("🌐 <b>Mengambil data dari URL...</b>", parse_mode="HTML")
+        status_msg = await update.message.reply_text("🛠️ <b>Processing: Fetching metadata...</b>", parse_mode="HTML")
         
         try:
             async with aiohttp.ClientSession() as session:
@@ -2802,9 +2786,15 @@ class DownloaderBot:
         )
 
     async def _cleanup_user_session(self, user_id, context, reason):
-        """Cleanup user session and temp files."""
+        """Cleanup user session and ALL temp files immediately."""
+        logger.info(f"🧹 Absolute cleanup for user {user_id} (Reason: {reason})")
         self.session_manager.force_cleanup_session(user_id)
-        # Additional cleanup if needed
+        
+        # Force delete user directory
+        user_dir = DOWNLOAD_DIR / str(user_id)
+        if user_dir.exists():
+            await FileCleanup.safe_delete(user_dir, delay=0)
+            logger.info(f"🧹 Force deleted session directory: {user_dir}")
 
     async def error_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle errors and cleanup files & session"""
@@ -2829,8 +2819,9 @@ class DownloaderBot:
         if update and update.effective_message:
             try:
                 await update.effective_message.reply_text(
-                    "❌ Terjadi kesalahan. File dan session dibersihkan. Silakan coba lagi.\n"
-                    "*(Semua file yang diunduh akan otomatis terhapus dalam 5 menit)*"
+                    "❌ <b>Gagal: Terjadi kesalahan sistem</b>\n\n"
+                    "<i>Seluruh file sementara dan session telah dibersihkan. Silakan coba lagi.</i>",
+                    parse_mode="HTML"
                 )
             except:
                 pass
