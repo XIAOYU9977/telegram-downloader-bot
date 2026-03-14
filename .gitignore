@@ -8,5 +8,6 @@ downloads/
 *.txt
 !requirements.txt
 !telegraph_token.txt
+subtitles/
 .vscode/
 .idea/
